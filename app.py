@@ -5,6 +5,7 @@
 即文档最后一块生成块，流式生成与手动编辑均在此进行）。
 """
 import datetime
+import glob
 import html
 import math
 import os
@@ -421,6 +422,10 @@ def on_add_generate(blocks, active_text):
         if seg_t and "".join(seg_t) == c:
             blk["ppl"] = {"token_texts": seg_t, "token_ppls": seg_p}
     blocks.append(blk)
+    # 自动锁定：新生成块（前一个生成块）之前的全部块折叠为标题栏，
+    # 聚焦当前写作；用户可随时点开标题栏解锁编辑
+    for b in blocks[:-1]:
+        b.setdefault("locked", True)
     _ACTIVE_PPL["token_texts"], _ACTIVE_PPL["token_ppls"] = [], []
     all_ppls = _blocks_ppls(blocks)
     return {
@@ -429,7 +434,7 @@ def on_add_generate(blocks, active_text):
         avg_ppl_num: round(avg_ppl_of(all_ppls) or 0.0, 2) if all_ppls else None,
         ppl_plot: plot_data(all_ppls),
         heatmap_md: doc_heatmap_html(blocks, ""),
-        status_tb: "已定稿当前生成块并开启新块（困惑度数据随块保留）",
+        status_tb: "已定稿当前生成块并开启新块（前序块已自动锁定折叠，困惑度数据随块保留）",
     }
 
 
@@ -444,6 +449,46 @@ def on_save(blocks, active_text):
         download_file: path,
         status_tb: f"💾 已保存：{fname}（可点击右侧文件下载）",
     }
+
+
+def toggle_block_lock(blocks_list, idx):
+    """翻转指定块的锁定状态（锁定=折叠为标题栏且不可编辑）。"""
+    blocks_list = [dict(b) for b in (blocks_list or [])]
+    if idx < 0 or idx >= len(blocks_list):
+        return gr.skip()
+    blocks_list[idx]["locked"] = not blocks_list[idx].get("locked", False)
+    return blocks_list
+
+
+# 定时自动保存：仅内容变化时落盘，并轮转仅保留最近 _AUTOSAVE_KEEP 份
+_AUTOSAVE_KEEP = 20
+_LAST_AUTOSAVE_TEXT = None
+
+
+def on_autosave(blocks, active_text, enabled):
+    if not enabled:
+        return {autosave_tb: ""}
+    content = serialize_doc(blocks or [], active_text or "")
+    if not content.strip():
+        return {autosave_tb: ""}
+    global _LAST_AUTOSAVE_TEXT
+    if content == _LAST_AUTOSAVE_TEXT:
+        return {autosave_tb: "🕒 无变化，跳过自动保存"}
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    # 微秒级时间戳：避免同一秒内多次内容不同的自动保存互相覆盖
+    fname = f"autosave_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}.md"
+    path = os.path.join(SAVE_DIR, fname)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        _LAST_AUTOSAVE_TEXT = content
+        files = sorted(glob.glob(os.path.join(SAVE_DIR, "autosave_*.md")),
+                       key=os.path.getmtime)
+        for old in files[:-_AUTOSAVE_KEEP]:
+            os.remove(old)
+    except OSError as e:  # 磁盘不可写等：不中断定时器
+        return {autosave_tb: f"⚠️ 自动保存失败：{e}"}
+    return {autosave_tb: f"🕒 已自动保存 {datetime.datetime.now():%H:%M:%S} → {fname}"}
 
 
 def on_load_doc(file):
@@ -618,35 +663,49 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
             def render_blocks(blocks):
                 for i, blk in enumerate(blocks or []):
                     is_prompt = blk["type"] == "prompt"
-                    label = ("📝 提示词块" if is_prompt else "⚙️ 生成块") + f" #{i + 1}"
+                    base_label = ("📝 提示词块" if is_prompt else "⚙️ 生成块") + f" #{i + 1}"
+                    locked = bool(blk.get("locked"))
                     with gr.Group():
-                        with gr.Row():
-                            tb = gr.Textbox(
-                                value=blk["content"],
-                                label=label,
-                                lines=4,
-                                interactive=True,
-                                scale=20,
+                        # 锁定块折叠为可展开标题栏（点击展开查看/解锁）
+                        with gr.Accordion(
+                            (f"🔒 {base_label} · 已锁定（点击展开）" if locked else base_label),
+                            open=not locked,
+                        ):
+                            with gr.Row():
+                                tb = gr.Textbox(
+                                    value=blk["content"],
+                                    label=base_label,
+                                    lines=4,
+                                    interactive=not locked,
+                                    scale=20,
+                                )
+                                del_btn = gr.Button("🗑 删除", size="sm", scale=1)
+                            lock_btn = gr.Button(
+                                "🔓 解锁（取消折叠）" if locked else "🔒 锁定（折叠隐藏）",
+                                size="sm",
                             )
-                            del_btn = gr.Button("🗑 删除", size="sm", scale=1)
 
-                        def _update(blocks_list, text, idx=i):
-                            blocks_list = [dict(b) for b in (blocks_list or [])]
-                            if idx >= len(blocks_list) or blocks_list[idx]["content"] == text:
-                                return gr.skip()  # 无变化：跳过，避免触发重渲染
-                            blocks_list[idx]["content"] = text
-                            blocks_list[idx].pop("ppl", None)  # 内容已改，着色数据失效
-                            return blocks_list
+                            def _update(blocks_list, text, idx=i):
+                                blocks_list = [dict(b) for b in (blocks_list or [])]
+                                if idx >= len(blocks_list) or blocks_list[idx]["content"] == text:
+                                    return gr.skip()  # 无变化：跳过，避免触发重渲染
+                                blocks_list[idx]["content"] = text
+                                blocks_list[idx].pop("ppl", None)  # 内容已改，着色数据失效
+                                return blocks_list
 
-                        def _delete(blocks_list, idx=i):
-                            return [b for j, b in enumerate(blocks_list or []) if j != idx]
+                            def _toggle(blocks_list, idx=i):
+                                return toggle_block_lock(blocks_list, idx)
 
-                        # 用 blur 而非 change：change 在 IME 按 Enter 确认候选词时
-                        # 也会触发，导致 blocks_state 更新 → @gr.render 销毁重建
-                        # 正在输入的组件 → SSE 响应解析失败（Could not parse
-                        # server response）。blur 仅失焦时触发，规避该竞态。
-                        tb.blur(_update, inputs=[blocks_state, tb], outputs=[blocks_state])
-                        del_btn.click(_delete, inputs=[blocks_state], outputs=[blocks_state])
+                            def _delete(blocks_list, idx=i):
+                                return [b for j, b in enumerate(blocks_list or []) if j != idx]
+
+                            # 用 blur 而非 change：change 在 IME 按 Enter 确认候选词时
+                            # 也会触发，导致 blocks_state 更新 → @gr.render 销毁重建
+                            # 正在输入的组件 → SSE 响应解析失败（Could not parse
+                            # server response）。blur 仅失焦时触发，规避该竞态。
+                            tb.blur(_update, inputs=[blocks_state, tb], outputs=[blocks_state])
+                            lock_btn.click(_toggle, inputs=[blocks_state], outputs=[blocks_state])
+                            del_btn.click(_delete, inputs=[blocks_state], outputs=[blocks_state])
 
             active_cell_tb = gr.Textbox(
                 label="⚙️ 生成块（当前·最后一块）— LLM 流式输出于此，暂停后可手动编辑，再次生成将续写",
@@ -680,6 +739,12 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
                 download_file = gr.File(label="下载区（保存后出现）", interactive=False, height=80)
 
             status_tb = gr.Textbox(label="状态", value="就绪。请先加载模型。", interactive=False)
+
+            with gr.Row():
+                autosave_cb = gr.Checkbox(
+                    value=True, label="定时自动保存（每 60 秒，仅内容变化时落盘）", scale=1
+                )
+                autosave_tb = gr.Textbox(label="自动保存记录", value="", interactive=False, scale=3)
 
     # ---------------------------------------------------------------- 事件接线
     _load_inputs = [backend_mode_rd, model_path_tb, api_base_tb, api_key_tb, api_model_tb]
@@ -719,6 +784,12 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
                              outputs=[skills_state, skills_check, skills_info, status_tb])
     upload_skill_file.change(on_upload_skill, inputs=[upload_skill_file],
                              outputs=[skills_state, skills_check, skills_info, status_tb])
+
+    # 定时自动保存：每 60 秒触发一次（后台不可见组件）
+    autosave_timer = gr.Timer(60)
+    autosave_timer.tick(on_autosave,
+                        inputs=[blocks_state, active_cell_tb, autosave_cb],
+                        outputs=[autosave_tb])
 
 if __name__ == "__main__":
     demo.queue().launch(theme=gr.themes.Soft(), inbrowser=True)
