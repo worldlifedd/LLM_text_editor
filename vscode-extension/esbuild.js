@@ -8,11 +8,13 @@ const watch = args.includes("--watch");
 
 // 把 Python 无头服务端复制进扩展目录，随 VSIX 一起发布：
 // 插件自包含，安装后无需外部 server.py 即可自动拉起服务。
-// 仓库根目录为单一事实来源，改动根文件后重新 compile 即可同步。
+// 仓库根目录为单一事实来源；python/ 为构建产物（git 不跟踪，见根 .gitignore），
+// compile / vsce package（vscode:prepublish）时清空重建，勿手改。
 const PY_FILES = ["server.py", "core.py", "backend.py", "skills.py", "requirements.txt"];
 function copyPython() {
   const root = path.resolve(__dirname, "..");
   const dest = path.join(__dirname, "python");
+  fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(dest, { recursive: true });
   for (const f of PY_FILES) {
     fs.copyFileSync(path.join(root, f), path.join(dest, f));

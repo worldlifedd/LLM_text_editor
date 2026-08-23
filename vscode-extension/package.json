@@ -129,7 +129,8 @@
   },
   "scripts": {
     "compile": "node esbuild.js && tsc --noEmit -p tsconfig.json",
-    "watch": "node esbuild.js --watch"
+    "watch": "node esbuild.js --watch",
+    "vscode:prepublish": "node esbuild.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

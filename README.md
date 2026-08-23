@@ -81,7 +81,8 @@ python app.py
 插件**自带 Python 无头服务端**（打包在扩展目录 `python/` 内），安装后无需手动启动、无需指定 `server.py` 路径——首次打开面板时插件会自动拉起服务。
 
 1. 安装插件：在 VSCode 中「扩展」→「…」→「从 VSIX 安装」
-   （源码调试则在 `vscode-extension/` 内 `npm install` 后按 F5）
+   （源码调试则在 `vscode-extension/` 内 `npm install` 后按 F5；
+   从源码打包 VSIX：`npx vsce package`，`python/` 服务端会自动从仓库根同步）
 
 2. 确保本机 Python 已安装服务依赖（只需一次；跑本地模型还需 torch/transformers，跑 GGUF 量化模型还需 llama-cpp-python）：
 
@@ -147,8 +148,9 @@ python app.py
 ├── saves/            # 文档保存目录（运行时生成）
 ├── vscode-extension/ # VSCode 插件前端
 │   ├── src/          # 插件源码（TS）：extension/generation/docmodel/panel/… 
+│   ├── python/       # 构建产物：打包时从仓库根自动复制（不入 git）
 │   ├── package.json  # 命令、快捷键、配置项声明
-│   └── esbuild.js    # 打包脚本
+│   └── esbuild.js    # 构建/打包脚本（编译 + 同步 python/）
 ├── requirements.txt
 ├── kv_cache_test.py      # KV 缓存回归：命中加速/贪心一致性/停止后再生成
 ├── ppl_accum_test.py     # 困惑度累积回归：跨块/编辑容错/序列化兼容
