@@ -5,3 +5,5 @@ saves/
 .trae/
 pylibs/
 node_modules/
+*.vsix
+vscode-extension/dist/
