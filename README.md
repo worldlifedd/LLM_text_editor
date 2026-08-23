@@ -76,17 +76,20 @@ python app.py
 
 ### 方式二：VSCode 插件前端
 
-1. 启动无头服务（也可不手动启动，插件默认自动拉起）：
+插件**自带 Python 无头服务端**（打包在扩展目录 `python/` 内），安装后无需手动启动、无需指定 `server.py` 路径——首次打开面板时插件会自动拉起服务。
+
+1. 安装插件：在 VSCode 中「扩展」→「…」→「从 VSIX 安装」
+   （源码调试则在 `vscode-extension/` 内 `npm install` 后按 F5）
+
+2. 确保本机 Python 已安装服务依赖（只需一次；跑本地模型还需 torch/transformers）：
 
    ```bash
-   python server.py            # 默认监听 127.0.0.1:8907
-   # 可选参数：python server.py --host 0.0.0.0 --port 8907
+   pip install fastapi uvicorn pyyaml requests
    ```
 
-2. 安装插件：在 VSCode 中「扩展」→「…」→「从 VSIX 安装」，或按 F5 调试运行
-   （`vscode-extension/` 目录内先执行 `npm install`，随后 `npm run compile` 或直接调试）
-
 3. 在侧边栏 **GTE 生成控制面板** 中连接服务、加载模型 / 连接 API、勾选技能并调整生成参数
+
+> 若使用仓库根目录的 `server.py`（例如调试最新改动），可在设置 `gte.serverScript` 中指定其绝对路径，插件将优先使用。
 
 #### 文档格式
 
@@ -125,7 +128,7 @@ python app.py
 | `gte.serverUrl` | `http://127.0.0.1:8907` | 无头服务地址 |
 | `gte.autoStartServer` | `true` | 服务不可达时自动用 python 拉起 server.py |
 | `gte.pythonCommand` | `python` | 启动 server.py 所用 Python 命令 |
-| `gte.serverScript` | 自动查找 | server.py 绝对路径（工作区 / 扩展目录） |
+| `gte.serverScript` | 扩展内 `python/` | server.py 绝对路径（留空用随包自带服务端） |
 | `gte.params` | 见面板 | 生成参数默认值 |
 
 ## 项目结构

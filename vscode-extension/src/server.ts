@@ -34,13 +34,13 @@ function findServerScript(): string | null {
   const cfg = vscode.workspace.getConfiguration("gte");
   const explicit = cfg.get<string>("serverScript");
   if (explicit) return explicit;
-  // 扩展目录旁（vscode-extension/.. 即仓库根）或扩展目录内
+  // 扩展目录内随 VSIX 打包的 Python 服务端（自包含，优先）
   const extRoot = path.dirname(path.dirname(__dirname));
   const candidates = [
+    path.join(extRoot, "python", "server.py"),
     path.join(extRoot, "server.py"),
     path.join(extRoot, "..", "server.py"),
     path.join(extRoot, "src", "server.py"),
-    path.join(extRoot, "server.py"),
   ];
   // 工作区文件夹
   const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;

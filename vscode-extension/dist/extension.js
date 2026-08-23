@@ -63,10 +63,10 @@ function findServerScript() {
     return explicit;
   const extRoot = path.dirname(path.dirname(__dirname));
   const candidates = [
+    path.join(extRoot, "python", "server.py"),
     path.join(extRoot, "server.py"),
     path.join(extRoot, "..", "server.py"),
-    path.join(extRoot, "src", "server.py"),
-    path.join(extRoot, "server.py")
+    path.join(extRoot, "src", "server.py")
   ];
   const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (ws)

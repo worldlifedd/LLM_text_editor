@@ -5,3 +5,4 @@ tsconfig.json
 esbuild.js
 *.vsix
 .gitignore
+**/__pycache__/**
