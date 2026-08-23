@@ -64,7 +64,15 @@ export function apiStatus(): Promise<{ kind: string; loaded: boolean; loading: b
   );
 }
 
-export function apiLoad(req: { mode: string; model_path?: string; base_url?: string; api_key?: string; model?: string }): Promise<{ accepted: boolean }> {
+export function apiLoad(req: {
+  mode: string;
+  model_path?: string;
+  base_url?: string;
+  api_key?: string;
+  model?: string;
+  n_gpu_layers?: number; // llamacpp：GPU offload 层数（-1=全部，0=纯 CPU）
+  n_ctx?: number;        // llamacpp：上下文窗口
+}): Promise<{ accepted: boolean }> {
   return postJson("/api/load", req);
 }
 

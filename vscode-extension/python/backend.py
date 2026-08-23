@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """LLM 后端：模型加载、流式生成、逐 token 困惑度采集、优雅停止。
 
-两种后端，公共接口：loaded / load / build_chat_prompt / build_flat_prompt /
+三种后端，公共接口：loaded / load / build_chat_prompt / build_flat_prompt /
 compute_context_ppl / generate_stream / stop / kind。
 - LocalBackend：本地 transformers 模型（困惑度采集方案见下）。
+- LlamaCppBackend：llama-cpp-python 进程内加载 GGUF 量化模型
+  （Q4_K_M / Q5_K_M / Q8_0 / IQ 系列等），适配各种量化 LLM 部署。
 - OpenAICompatBackend：OpenAI 兼容 Chat Completions API（OpenAI/DeepSeek/
   Qwen/GLM/Kimi/vLLM/Ollama 等），SSE 流式，logprobs 可用时计算逐 token 困惑度。
 
@@ -16,11 +18,13 @@ compute_context_ppl / generate_stream / stop / kind。
 - 流结束时用保留的最后分布补齐尾部 token 的 log-prob。
 显存开销：仅常驻一个 vocab 维向量。
 
-torch/transformers 为惰性加载：仅 LocalBackend（本地模式）真正使用时才引入，
-因此只用 API 模式时无需安装 torch（见 _local_deps）。
+torch/transformers 与 llama_cpp 均为惰性加载：仅对应后端真正使用时才引入，
+因此只用 API 模式时无需安装 torch / llama-cpp-python（见 _local_deps /
+_require_llama_cpp）。
 """
 import json
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 
@@ -113,6 +117,25 @@ def _local_deps():
         "_StopOnEvent": _StopOnEvent,
     }
     return _LOCAL_DEPS
+
+
+_llama_cpp = None
+
+
+def _require_llama_cpp():
+    """惰性引入 llama_cpp（llama-cpp-python），未安装时给出安装指引。"""
+    global _llama_cpp
+    if _llama_cpp is None:
+        try:
+            import llama_cpp
+        except ImportError as e:
+            raise ImportError(
+                "llama-cpp-python 未安装：pip install llama-cpp-python"
+                "（CUDA 加速版安装方法见"
+                " https://github.com/abetlen/llama-cpp-python#usage-with-gpu）"
+            ) from e
+        _llama_cpp = llama_cpp
+    return _llama_cpp
 
 
 def _common_prefix_len(a, b):
@@ -397,6 +420,356 @@ class LocalBackend:
                 self._kv_cache.crop(safe_len)
                 self._cache_ids = full_ids[:safe_len]
         yield _final_snapshot
+
+
+class LlamaCppBackend:
+    """基于 llama-cpp-python 的本地 GGUF 量化模型后端。
+
+    面向 llama.cpp 生态的各种量化 LLM 部署（Q4_K_M / Q5_K_M / Q8_0 / IQ 系列…）：
+    - load：本地 .gguf 文件直接加载；非本地路径视为 HuggingFace GGUF 仓库 ID
+      （Llama.from_pretrained 自动下载，如 Qwen/Qwen2.5-0.5B-Instruct-GGUF）。
+    - 聊天模板：读取 GGUF 内嵌 tokenizer.chat_template，经 llama-cpp-python
+      自带的 Jinja2ChatFormatter（jinja2）渲染，与 llama.cpp server 行为一致；
+      模型未内嵌模板时报错并提示改用 prefix/raw 模式。
+    - 流式生成：迭代 Llama.generate()（流式 token 生成器），每个 token 产出
+      时经 llama_get_logits 读取产生该 token 的原始分布（惩罚/温度整形前，
+      语义同 LocalBackend 的 ppl 采集）→ 逐 token 困惑度。不经
+      create_completion(logprobs=..)——该路径要求 logits_all=True，会预分配
+      n_ctx×vocab 的巨型 scores 数组（4k 上下文 × 15 万词表 ≈ 2.4GB），对
+      量化小内存部署不友好。
+    - 上下文困惑度：reset 后逐 token eval 前向打分 exp(mean CE)，与
+      llama.cpp 官方 perplexity 工具同思路。
+    - KV 缓存：Llama.generate 自带最长公共前缀复用（同一 Llama 对象连续
+      生成），last_cache_info 汇报命中情况；prompt 超出 n_ctx 时保留
+      尾部（最新上下文）。
+    """
+
+    kind = "llamacpp"
+
+    def __init__(self):
+        self._llm = None
+        self.model_name = ""
+        self.device = "cpu"
+        self.quant_info = ""        # 量化信息（模型名 + Q4_K_M 等，元数据可得时）
+        self.context_size = 0       # 实际生效的上下文窗口
+        self.last_cache_info = ""   # 最近一次生成的缓存命中信息（UI 展示用）
+        self._stop_event = threading.Event()
+
+    # ------------------------------------------------------------------ 加载
+    @property
+    def loaded(self) -> bool:
+        return self._llm is not None
+
+    def load(self, model_path: str, n_gpu_layers: int = -1, n_ctx: int = 4096):
+        """加载 GGUF 模型。model_path 为本地 .gguf 文件或 HF GGUF 仓库 ID。
+
+        n_gpu_layers：GPU offload 层数（-1=全部，0=纯 CPU）；
+        n_ctx：上下文窗口（KV cache 容量）。
+        """
+        llama_cpp = _require_llama_cpp()
+        path = (model_path or "").strip()
+        if not path:
+            raise ValueError(
+                "GGUF 模型路径不能为空，例如 models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+                " 或 HF 仓库 Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+            )
+        n_ctx = max(int(n_ctx), 512)
+        kwargs = dict(n_ctx=n_ctx, n_gpu_layers=int(n_gpu_layers), verbose=False)
+        if os.path.exists(path):
+            self._llm = llama_cpp.Llama(model_path=path, **kwargs)
+        else:
+            # HuggingFace GGUF 仓库 ID（下载仓库内 *.gguf；仓库含多个量化文件
+            # 时建议先下载到本地再填文件路径）
+            self._llm = llama_cpp.Llama.from_pretrained(
+                repo_id=path, filename="*.gguf", **kwargs
+            )
+        self.model_name = path
+        self.context_size = self._n_ctx()
+        gpu = int(n_gpu_layers)
+        self.device = (
+            "CPU" if gpu == 0
+            else f"GPU×{gpu}层" if gpu > 0
+            else "GPU(全部层)" if gpu == -1
+            else "CPU"
+        )
+        self.quant_info = self._quant_desc()
+        self._stop_event = threading.Event()
+        self.last_cache_info = ""
+
+    # ------------------------------------------------------------ 底层访问
+    def _n_ctx(self) -> int:
+        """实际上下文窗口（新版 n_ctx 为方法，旧版为属性，兼容两者）。"""
+        raw = getattr(self._llm, "n_ctx", 4096)
+        try:
+            return max(int(raw() if callable(raw) else raw), 512)
+        except (TypeError, ValueError):
+            return 4096
+
+    def _n_vocab(self) -> int:
+        """词表大小（新版 n_vocab 为方法，旧版为属性，兼容两者）。"""
+        raw = getattr(self._llm, "n_vocab", 0)
+        try:
+            return int(raw() if callable(raw) else raw)
+        except (TypeError, ValueError):
+            return 0
+
+    def _read_logits(self, np):
+        """读取最近一次 decode 末位置的完整 logits（float64 副本，防覆盖）。
+
+        不可用（接口不兼容）时返回 None → 困惑度退化为无数据。
+        """
+        llama_cpp = _require_llama_cpp()
+        try:
+            n_vocab = self._n_vocab()
+            if n_vocab <= 0:
+                return None
+            ptr = llama_cpp.llama_get_logits(self._llm.ctx)
+            if not ptr:
+                return None
+            return np.array(
+                np.ctypeslib.as_array(ptr, shape=(n_vocab,)), dtype=np.float64
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _is_eog(self, token) -> bool:
+        """是否为结束生成 token（EOG，含 EOS）。"""
+        try:
+            llama_cpp = _require_llama_cpp()
+            return bool(
+                llama_cpp.llama_vocab_is_eog(self._llm._model.vocab, token)
+            )
+        except Exception:  # noqa: BLE001  老版本回退：仅比对 EOS id
+            try:
+                return token == self._llm.token_eos()
+            except Exception:  # noqa: BLE001
+                return False
+
+    # ---------------------------------------------------------------- 元数据
+    def _meta(self) -> dict:
+        """GGUF 元数据（llama-cpp-python Llama.metadata，版本兼容防御）。"""
+        try:
+            return dict(getattr(self._llm, "metadata", None) or {})
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _quant_desc(self) -> str:
+        """模型名 + 量化类型（general.file_type → Q4_K_M 等）。"""
+        m = self._meta()
+        name = m.get("general.name") or ""
+        q = ""
+        raw_ft = m.get("general.file_type")
+        if raw_ft is not None:
+            try:
+                code = int(str(raw_ft))
+                names = {}
+                for mod in (_llama_cpp, getattr(_llama_cpp, "llama_cpp", None)):
+                    if mod is None:
+                        continue
+                    for attr in dir(mod):
+                        if attr.startswith("LLAMA_FTYPE_MOSTLY_"):
+                            names[getattr(mod, attr)] = attr[len("LLAMA_FTYPE_MOSTLY_"):]
+                q = names.get(code, f"ftype={code}")
+            except (TypeError, ValueError):
+                q = ""
+        return "｜".join(p for p in (name, q) if p)
+
+    # -------------------------------------------------------------- 聊天模板
+    def _detok_text(self, token_ids) -> str:
+        try:
+            return self._llm.detokenize(list(token_ids)).decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _render_chat(self, messages) -> str:
+        """messages → GGUF 内嵌聊天模板渲染文本（含 assistant 起始标记）。"""
+        llama_cpp = _require_llama_cpp()
+        template = self._meta().get("tokenizer.chat_template", "")
+        if not template:
+            raise ValueError(
+                "该 GGUF 未内嵌 tokenizer.chat_template，chat 模式不可用；"
+                "请改用 prefix/raw 上下文模式，或换用带聊天模板的 Instruct 量化模型"
+            )
+        lcf = llama_cpp.llama_chat_format
+        formatter = lcf.Jinja2ChatFormatter(
+            template=template,
+            eos_token=self._detok_text([self._llm.token_eos()]),
+            bos_token=self._detok_text([self._llm.token_bos()]),
+        )
+        try:
+            resp = formatter(messages=list(messages))            # 0.3.x：__call__
+        except TypeError:
+            resp = formatter.format_messages(list(messages))     # 旧版方法名
+        return resp.prompt
+
+    def apply_chat_template(self, messages, active_text):
+        """messages → 模板化生成前缀文本（含 assistant 起始标记）+ 活动块续写头。"""
+        return self._render_chat(messages) + (active_text or "")
+
+    # ----------------------------------------------------------- prompt 构造
+    def build_chat_prompt(self, messages, active_text):
+        """chat 模式：llama.cpp 后端 → 应用聊天模板后的平文本 str。"""
+        return self.apply_chat_template(messages, active_text)
+
+    def build_flat_prompt(self, flat_text):
+        """prefix/raw 模式：llama.cpp 后端 → 原样平文本 str。"""
+        return flat_text
+
+    # ------------------------------------------------------------ token 工具
+    def _tokenize(self, text: str) -> list:
+        """文本 → token id 列表（special 解析，与库内字符串 prompt 路径一致）。
+
+        tokenize 默认 add_bos=True；模板自身已内嵌 BOS 文本时会产生重复
+        前导 BOS（llama-cpp-python 对此仅告警），此处显式去重。
+        """
+        ids = self._llm.tokenize(text.encode("utf-8"), special=True)
+        try:
+            bos = self._llm.token_bos()
+            if bos is not None and len(ids) >= 2 and ids[0] == ids[1] == bos:
+                ids = ids[1:]
+        except Exception:  # noqa: BLE001
+            pass
+        return ids
+
+    # -------------------------------------------------------------- 困惑度
+    def compute_context_ppl(self, text: str) -> float:
+        """上下文困惑度：逐 token 前向打分 exp(mean CE)。提示词准确度指标。
+
+        与 llama.cpp 官方 perplexity 工具同思路：reset 后逐 token eval，
+        每步从 llama_get_logits 取完整分布，log_softmax 回填下一 token 的
+        log-prob；超长文本保留尾部（最新上下文）。打分后上下文即被评文本，
+        同 prompt 的下一次生成可命中 KV 前缀缓存。
+        """
+        if not self.loaded or not text.strip():
+            return float("nan")
+        try:
+            import numpy as np
+        except ImportError:
+            return float("nan")
+        toks = self._tokenize(text)
+        if len(toks) < 2:
+            return float("nan")
+        limit = self._n_ctx() - 2
+        if len(toks) > limit:
+            toks = toks[-limit:]
+        try:
+            self._llm.reset()
+            log_probs = []
+            for i in range(len(toks) - 1):
+                self._llm.eval([toks[i]])
+                logits = self._read_logits(np)
+                if logits is None:
+                    return float("nan")
+                m = float(logits.max())
+                lse = m + math.log(float(np.exp(logits - m).sum()))
+                log_probs.append(float(logits[toks[i + 1]]) - lse)
+        except Exception:  # noqa: BLE001  eval 接口不兼容等 → 退化为不可用
+            return float("nan")
+        return math.exp(min(-sum(log_probs) / len(log_probs), 20.0))
+
+    # ---------------------------------------------------------------- 生成
+    def stop(self):
+        """请求优雅停止：流式循环在每个 token 间检查事件，自然收尾。"""
+        self._stop_event.set()
+
+    def _cache_note(self, prompt_tokens) -> str:
+        """生成前的 KV 前缀缓存命中预估（Llama.generate 按最长公共前缀复用）。"""
+        try:
+            ids = getattr(self._llm, "_input_ids", None)
+            if ids is None:
+                ids = getattr(self._llm, "input_ids", None)
+            n = int(getattr(self._llm, "n_tokens", 0) or 0)
+            if ids is None or n <= 0:
+                return "KV缓存未命中"
+            ctx_ids = [int(t) for t in list(ids)[:n]]
+        except Exception:  # noqa: BLE001
+            return ""
+        k = _common_prefix_len(ctx_ids, prompt_tokens)
+        if k < _MIN_CACHE_REUSE:
+            return "KV缓存未命中"
+        return f"⚡KV缓存复用 {k}/{len(prompt_tokens)} token"
+
+    def generate_stream(self, context: str, **gen_params):
+        """流式生成。yield GenUpdate；自然结束/停止后额外 yield final=True 快照。
+
+        迭代 Llama.generate()：token 逐个产出（生成惰性推进，stop 检查即时
+        生效），每个 token 产出时 llama_get_logits 恰为产生该 token 的原始
+        分布（惩罚/温度整形前）→ log_softmax 取该 token 的 log-prob 即逐
+        token 困惑度；接口不可用时自动退化为无困惑度。
+        gen_params: max_new_tokens / do_sample / temperature / top_k / top_p /
+        repetition_penalty（映射为 llama.cpp 的 repeat_penalty）。
+        """
+        if not self.loaded:
+            raise RuntimeError("模型尚未加载，请先在顶栏加载 GGUF 模型")
+
+        import numpy as np
+
+        self._stop_event = threading.Event()
+        do_sample = bool(gen_params.get("do_sample", True))
+        max_tokens = int(gen_params.get("max_new_tokens", 256))
+
+        # 上下文窗口管理：超长 prompt 保留尾部（最新上下文），max_tokens 不越界
+        toks = self._tokenize(context)
+        n_ctx = self._n_ctx()
+        if len(toks) > n_ctx - 8:
+            toks = toks[-(n_ctx - 8):]
+        max_tokens = max(1, min(max_tokens, n_ctx - len(toks) - 1))
+        self.last_cache_info = self._cache_note(toks)
+
+        gen = self._llm.generate(
+            toks,
+            top_k=int(gen_params.get("top_k", 50)),
+            top_p=float(gen_params.get("top_p", 0.95)),
+            temp=float(gen_params.get("temperature", 0.8)) if do_sample else 0.0,
+            repeat_penalty=float(gen_params.get("repetition_penalty", 1.1)),
+        )
+
+        cum_text = ""
+        token_texts: list = []
+        token_ppls: list = []
+        completion_tokens: list = []
+        n_gen = 0
+        try:
+            for token in gen:
+                if self._stop_event.is_set():
+                    break
+                if self._is_eog(token):  # 结束生成，不计入文本/困惑度
+                    break
+                # 困惑度：此刻 logits 缓冲区恰为产生该 token 的原始分布
+                logits = self._read_logits(np)
+                # token-文本对齐（增量解码差分法，同 LocalBackend）：逐 token
+                # 解码前缀取差分，中文多字节字符跨 token 不乱码（未完成字节
+                # 暂缺、完成后经差分补齐，"".join(token_texts)==cum_text 恒成立）
+                completion_tokens.append(token)
+                new_text = self._llm.detokenize(
+                    completion_tokens, prev_tokens=toks
+                ).decode("utf-8", errors="ignore")
+                piece = new_text[len(cum_text):]
+                cum_text = new_text
+                token_texts.append(piece)
+                if logits is not None:
+                    m = float(logits.max())
+                    lse = m + math.log(float(np.exp(logits - m).sum()))
+                    lp = float(logits[token]) - lse
+                    token_ppls.append(math.exp(min(-lp, 20.0)))
+                yield GenUpdate(
+                    cum_text=cum_text, token_ppls=list(token_ppls),
+                    token_texts=list(token_texts),
+                )
+                n_gen += 1
+                if n_gen >= max_tokens:
+                    break
+        finally:
+            close = getattr(gen, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
+        yield GenUpdate(
+            cum_text=cum_text, token_ppls=token_ppls,
+            token_texts=token_texts, final=True,
+        )
 
 
 class OpenAICompatBackend:

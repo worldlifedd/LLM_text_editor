@@ -72,9 +72,9 @@ export function activate(context: vscode.ExtensionContext): void {
       const label = st.loading
         ? `$(sync~spin) GTE: 加载中…`
         : st.loaded
-        ? `$(check) GTE: ${st.kind === "local" ? "本地" : "API"}${
-            st.generating ? "｜生成中…" : ""
-          }`
+        ? `$(check) GTE: ${
+            st.kind === "local" ? "本地" : st.kind === "llamacpp" ? "llama.cpp" : "API"
+          }${st.generating ? "｜生成中…" : ""}`
         : "GTE: 未连接";
       statusBar.text = label;
       statusBar.tooltip = st.message;
@@ -111,6 +111,8 @@ export function activate(context: vscode.ExtensionContext): void {
             base_url: m.base_url as string,
             api_key: m.api_key as string,
             model: m.model as string,
+            n_gpu_layers: typeof m.n_gpu_layers === "number" ? m.n_gpu_layers : undefined,
+            n_ctx: typeof m.n_ctx === "number" ? m.n_ctx : undefined,
           });
           vscode.window.showInformationMessage("已提交加载请求，请稍候…（看下方状态）");
         } catch (e) {

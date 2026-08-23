@@ -26,12 +26,13 @@
   </generate>
   ```
 
-### 双后端
+### 三后端
 - **本地后端**（transformers）：支持任意 HuggingFace / 本地路径模型，CUDA fp16 / CPU fp32 自适应
+- **llama.cpp 后端**（`llama-cpp-python`）：进程内加载 GGUF 量化模型（Q4_K_M / Q5_K_M / Q8_0 / IQ 系列等），小显存 / 纯 CPU 也能跑大模型；支持 GPU offload 层数（`n_gpu_layers`）与上下文窗口（`n_ctx`）调节；聊天模板读取 GGUF 内嵌 `tokenizer.chat_template` 渲染（与 llama.cpp server 行为一致）；逐 token / 上下文困惑度可用；KV 前缀缓存由 `Llama.generate` 自动复用
 - **API 后端**（OpenAI 兼容）：覆盖 OpenAI / DeepSeek / Qwen / GLM / Kimi，以及 vLLM / Ollama / llama.cpp server 等本地推理服务，SSE 流式
 
 ### 困惑度（Perplexity）分析
-- **上下文困惑度**：一次前向传播评估提示词与模型的匹配度（仅本地模式）
+- **上下文困惑度**：一次前向传播评估提示词与模型的匹配度（本地 / llama.cpp 模式）
 - **逐 token 生成困惑度**：本地用 LogitsProcessor 采集；API 模式经 logprobs 自动探测（不支持时降级）
 - **伪彩色热力图**：绿（模型确定）→ 红（模型困惑），覆盖**全部生成块**
 - 折线图 + 滑动平均 + 全文档几何平均困惑度
@@ -72,6 +73,7 @@ python app.py
 
 在顶栏选择后端模式：
 - **本地模型**：填写模型路径或 HF ID（默认 `Qwen/Qwen2.5-0.5B-Instruct`），点击「加载模型」
+- **llama.cpp（GGUF 量化模型）**：填写本地 `.gguf` 文件路径（如 `models/qwen2.5-0.5b-instruct-q4_k_m.gguf`）或 HF GGUF 仓库 ID（如 `Qwen/Qwen2.5-0.5B-Instruct-GGUF`，首次自动下载），调节 `n_gpu_layers` / `n_ctx` 后点击「加载 GGUF」；需 `pip install llama-cpp-python`
 - **API**：填写 base_url（到 `/v1` 层级）、API Key、模型名，点击「连接 API」
 
 ### 方式二：VSCode 插件前端
@@ -81,10 +83,11 @@ python app.py
 1. 安装插件：在 VSCode 中「扩展」→「…」→「从 VSIX 安装」
    （源码调试则在 `vscode-extension/` 内 `npm install` 后按 F5）
 
-2. 确保本机 Python 已安装服务依赖（只需一次；跑本地模型还需 torch/transformers）：
+2. 确保本机 Python 已安装服务依赖（只需一次；跑本地模型还需 torch/transformers，跑 GGUF 量化模型还需 llama-cpp-python）：
 
    ```bash
    pip install fastapi uvicorn pyyaml requests
+   pip install llama-cpp-python   # llama.cpp 模式（GGUF 量化模型）
    ```
 
 3. 在侧边栏 **GTE 生成控制面板** 中连接服务、加载模型 / 连接 API、勾选技能并调整生成参数
@@ -137,7 +140,7 @@ python app.py
 ├── app.py            # Gradio 前端：分块编辑、困惑度可视化、技能库面板
 ├── server.py         # FastAPI 无头服务：REST + SSE，供 VSCode 插件等前端使用
 ├── core.py           # 共享纯逻辑：文档序列化、上下文组装、困惑度聚合
-├── backend.py        # LLM 后端：LocalBackend（KV缓存）/ OpenAICompatBackend（SSE）
+├── backend.py        # LLM 后端：LocalBackend（KV缓存）/ LlamaCppBackend（GGUF 量化）/ OpenAICompatBackend（SSE）
 ├── skills.py         # 技能扫描、解析（SKILL.md frontmatter）、上下文拼接
 ├── skills/           # 技能库目录
 │   └── 中文散文写作/SKILL.md
@@ -151,11 +154,14 @@ python app.py
 ├── ppl_accum_test.py     # 困惑度累积回归：跨块/编辑容错/序列化兼容
 ├── lock_autosave_test.py # 块锁定 + 定时自动保存逻辑回归
 ├── regress3_test.py      # 服务器 REST 回归（需 app.py 已启动）
-└── server_test.py        # 无头服务 REST/SSE 回归（需 server.py 已启动）
+├── server_test.py        # 无头服务 REST/SSE 回归（需 server.py 已启动）
+├── test_llamacpp_mock.py # LlamaCppBackend mock 单测（无需模型/llama-cpp-python）
+└── test_llamacpp_model.py # llama.cpp 真实模型回归（GGUF_MODEL 指定模型，缺失时跳过）
 ```
 
 ## 已知约束
 
 - Windows IME 兼容：块编辑用 `blur` 事件提交（`change` 会在输入法确认候选词时触发组件重建）
 - transformers 建议 4.44–4.49（5.x 与 torch 2.5 存在 `CPUOffloadPolicy` 兼容问题）
+- llama.cpp 模式：base 模型的 GGUF 通常未内嵌聊天模板，`chat` 上下文模式会报错提示改用 `prefix`/`raw`；逐 token 困惑度经 `llama_get_logits` 读取原始分布，接口不可用的老版本自动退化为无困惑度
 - API 模式下上下文困惑度不可用（Chat Completions 不返回 prompt token 概率）；DeepSeek 等不支持 logprobs 的服务自动降级为无逐 token 困惑度
