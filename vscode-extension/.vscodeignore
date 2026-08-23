@@ -6,3 +6,4 @@ esbuild.js
 *.vsix
 .gitignore
 **/__pycache__/**
+python/no_torch_run.py

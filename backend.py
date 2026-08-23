@@ -15,6 +15,9 @@ compute_context_ppl / generate_stream / stop / kind。
 - _TokenStream(TextIteratorStreamer)：put() 时记录全部生成 token id。
 - 流结束时用保留的最后分布补齐尾部 token 的 log-prob。
 显存开销：仅常驻一个 vocab 维向量。
+
+torch/transformers 为惰性加载：仅 LocalBackend（本地模式）真正使用时才引入，
+因此只用 API 模式时无需安装 torch（见 _local_deps）。
 """
 import json
 import math
@@ -22,17 +25,94 @@ import threading
 from dataclasses import dataclass, field
 
 import requests
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    DynamicCache,
-    LogitsProcessor,
-    LogitsProcessorList,
-    StoppingCriteria,
-    StoppingCriteriaList,
-    TextIteratorStreamer,
-)
+
+# ---------------------------------------------------------------- 惰性加载
+_torch = None
+_tf = None
+
+
+def _require_torch():
+    """惰性引入 torch/transformers，返回 (torch, transformers)。"""
+    global _torch, _tf
+    if _torch is None:
+        import torch
+        import transformers
+
+        _torch, _tf = torch, transformers
+    return _torch, _tf
+
+
+_LOCAL_DEPS = None
+
+
+def _local_deps():
+    """构造并缓存本地模式所需的 torch/transformers 依赖（含子类定义）。
+
+    子类需在 transformers 导入后才能定义，故统一放进这里懒加载，
+    避免模块导入期强依赖 torch（API-only 安装可无 torch）。
+    """
+    global _LOCAL_DEPS
+    if _LOCAL_DEPS is not None:
+        return _LOCAL_DEPS
+    torch, tf = _require_torch()
+
+    class _PplProcessor(tf.LogitsProcessor):
+        """逐 token 困惑度采集（滞后一步回填）。
+
+        注意：用户 logits_processor 在 _get_logits_processor 中于采样 warper
+        （temperature/top_k/top_p）之前合并，因此这里的分布是「经惩罚项整形后的
+        模型预测分布」——贪心模式下即最终决策分布；采样模式下为模型自身预测
+        （未截断），更贴近"模型对文本的意外程度"语义。
+        """
+
+        def __init__(self):
+            self.log_probs: list = []          # 每个 token 的 log-prob（滞后一步）
+            self.prev_logprobs = None          # 上一步分布的 log_softmax（vocab,）
+
+        def __call__(self, input_ids, scores):
+            if self.prev_logprobs is not None:
+                self.log_probs.append(self.prev_logprobs[input_ids[0, -1]].item())
+            self.prev_logprobs = torch.log_softmax(scores[0].float(), dim=-1)
+            return scores
+
+    class _TokenStream(tf.TextIteratorStreamer):
+        """流式输出同时记录生成 token id 序列（跳过首次 put 的 prompt tokens）。"""
+
+        def __init__(self, tokenizer, **kwargs):
+            super().__init__(tokenizer, **kwargs)
+            self.token_ids: list = []
+            self._first_put = True
+
+        def put(self, value):
+            if self._first_put:
+                # generate 会先 streamer.put(prompt_ids)（skip_prompt 机制依赖此行为）
+                self._first_put = False
+            else:
+                self.token_ids.extend(value.reshape(-1).tolist())
+            super().put(value)
+
+    class _StopOnEvent(tf.StoppingCriteria):
+        """优雅停止：外部 threading.Event 置位后在下一步返回 True。"""
+
+        def __init__(self, stop_event: threading.Event):
+            super().__init__()
+            self.stop_event = stop_event
+
+        def __call__(self, input_ids, scores, **kwargs) -> bool:
+            return bool(self.stop_event.is_set())
+
+    _LOCAL_DEPS = {
+        "torch": torch,
+        "AutoModelForCausalLM": tf.AutoModelForCausalLM,
+        "AutoTokenizer": tf.AutoTokenizer,
+        "DynamicCache": tf.DynamicCache,
+        "LogitsProcessorList": tf.LogitsProcessorList,
+        "StoppingCriteriaList": tf.StoppingCriteriaList,
+        "_PplProcessor": _PplProcessor,
+        "_TokenStream": _TokenStream,
+        "_StopOnEvent": _StopOnEvent,
+    }
+    return _LOCAL_DEPS
 
 
 def _common_prefix_len(a, b):
@@ -57,54 +137,6 @@ class GenUpdate:
     final: bool = False                                  # 是否为本次流式的最后一次更新
 
 
-class _PplProcessor(LogitsProcessor):
-    """逐 token 困惑度采集（滞后一步回填）。
-
-    注意：用户 logits_processor 在 _get_logits_processor 中于采样 warper
-    （temperature/top_k/top_p）之前合并，因此这里的分布是「经惩罚项整形后的
-    模型预测分布」——贪心模式下即最终决策分布；采样模式下为模型自身预测
-    （未截断），更贴近"模型对文本的意外程度"语义。
-    """
-
-    def __init__(self):
-        self.log_probs: list = []          # 每个 token 的 log-prob（滞后一步）
-        self.prev_logprobs = None          # 上一步分布的 log_softmax（vocab,）
-
-    def __call__(self, input_ids, scores):
-        if self.prev_logprobs is not None:
-            self.log_probs.append(self.prev_logprobs[input_ids[0, -1]].item())
-        self.prev_logprobs = torch.log_softmax(scores[0].float(), dim=-1)
-        return scores
-
-
-class _TokenStream(TextIteratorStreamer):
-    """流式输出同时记录生成 token id 序列（跳过首次 put 的 prompt tokens）。"""
-
-    def __init__(self, tokenizer, **kwargs):
-        super().__init__(tokenizer, **kwargs)
-        self.token_ids: list = []
-        self._first_put = True
-
-    def put(self, value):
-        if self._first_put:
-            # generate 会先 streamer.put(prompt_ids)（skip_prompt 机制依赖此行为）
-            self._first_put = False
-        else:
-            self.token_ids.extend(value.reshape(-1).tolist())
-        super().put(value)
-
-
-class _StopOnEvent(StoppingCriteria):
-    """优雅停止：外部 threading.Event 置位后在下一步返回 True。"""
-
-    def __init__(self, stop_event: threading.Event):
-        super().__init__()
-        self.stop_event = stop_event
-
-    def __call__(self, input_ids, scores, **kwargs) -> bool:
-        return bool(self.stop_event.is_set())
-
-
 class LocalBackend:
     """本地 transformers 模型封装（含 KV 前缀缓存加速 prefill）。"""
 
@@ -119,7 +151,7 @@ class LocalBackend:
         # KV 前缀缓存：保存上次生成结束时的 KV（保守少记最后 1 个 token，
         # 因 generate 未必对最后一个 token 做前向），下次生成先求最长公共
         # 前缀，命中部分免 prefill，只对新增 token 增量前向。
-        self._kv_cache: DynamicCache | None = None
+        self._kv_cache = None  # 运行时为 transformers DynamicCache | None
         self._cache_ids: list = []
         self.last_cache_info = ""  # 最近一次生成的缓存命中信息（UI 展示用）
         self._gen_thread: threading.Thread | None = None  # 当前生成线程（串行化用）
@@ -131,10 +163,12 @@ class LocalBackend:
 
     def load(self, model_path: str):
         """加载本地路径或 HuggingFace hub 模型。CUDA -> fp16，CPU -> fp32。"""
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        d = _local_deps()
+        torch = d["torch"]
+        self.tokenizer = d["AutoTokenizer"].from_pretrained(model_path, trust_remote_code=True)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = d["AutoModelForCausalLM"].from_pretrained(
             model_path,
             torch_dtype=dtype,
             device_map="auto",
@@ -166,15 +200,16 @@ class LocalBackend:
         return flat_text
 
     # -------------------------------------------------------------- 困惑度
-    @torch.no_grad()
     def compute_context_ppl(self, text: str) -> float:
         """上下文困惑度：一次前向传播 exp(mean CE)。提示词准确度指标。"""
         if not self.loaded or not text.strip():
             return float("nan")
+        torch = _require_torch()[0]
         enc = self.tokenizer(text, return_tensors="pt").to(self.model.device)
         if enc.input_ids.shape[1] < 2:
             return float("nan")
-        out = self.model(**enc, labels=enc.input_ids)
+        with torch.no_grad():
+            out = self.model(**enc, labels=enc.input_ids)
         return math.exp(min(out.loss.item(), 20.0))
 
     # ---------------------------------------------------------------- 生成
@@ -191,6 +226,9 @@ class LocalBackend:
         if not self.loaded:
             raise RuntimeError("模型尚未加载，请先在顶栏加载模型")
 
+        d = _local_deps()
+        torch = d["torch"]
+
         # 串行化：若上一次生成线程尚未退出（如刚点停止就重启生成），
         # 先请求其收尾并等待退出——两个 generate 并发跑会同时写同一个
         # KV cache 对象（crop/append 竞态），导致 cache 状态错乱。
@@ -202,10 +240,10 @@ class LocalBackend:
 
         self._stop_event = threading.Event()
         self._gen_error: Exception | None = None
-        streamer = _TokenStream(
+        streamer = d["_TokenStream"](
             self.tokenizer, skip_prompt=True, skip_special_tokens=True
         )
-        proc = _PplProcessor()
+        proc = d["_PplProcessor"]()
 
         # ---- prefill：KV 前缀缓存命中部分免重算，仅对新增 token 增量前向 ----
         # 4.49 generate 语义：传完整 input_ids + past_key_values（含前 n-1 个
@@ -219,7 +257,7 @@ class LocalBackend:
             if k < _MIN_CACHE_REUSE:
                 cache, k = None, 0
         if cache is None:
-            cache = DynamicCache()
+            cache = d["DynamicCache"]()
         else:
             if k >= len(ids):
                 # 缓存已覆盖整个 prompt（如立即重新生成同一上下文）：
@@ -241,7 +279,7 @@ class LocalBackend:
                     )
             except Exception:  # noqa: BLE001  预填失败（如显存不足）→ 弃缓存全量重来
                 self._kv_cache, self._cache_ids, cache, k = None, [], None, 0
-                cache = DynamicCache()
+                cache = d["DynamicCache"]()
                 prefill_ids = ids[:-1]
                 with torch.no_grad():
                     self.model(
@@ -267,8 +305,8 @@ class LocalBackend:
             streamer=streamer,
             past_key_values=cache,
             use_cache=True,
-            logits_processor=LogitsProcessorList([proc]),
-            stopping_criteria=StoppingCriteriaList([_StopOnEvent(self._stop_event)]),
+            logits_processor=d["LogitsProcessorList"]([proc]),
+            stopping_criteria=d["StoppingCriteriaList"]([d["_StopOnEvent"](self._stop_event)]),
         )
         if do_sample:
             kwargs.update(
