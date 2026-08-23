@@ -13,7 +13,7 @@ import os
 import gradio as gr
 import pandas as pd
 
-from backend import LocalBackend, OpenAICompatBackend
+from backend import LlamaCppBackend, LocalBackend, OpenAICompatBackend
 from core import (
     avg_ppl_of,
     blocks_ppls,
@@ -27,8 +27,12 @@ from skills import SKILLS_DIR, import_skill_file, scan_skills, skills_to_context
 
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saves")
 
-# 单用户本地应用：两种后端常驻（切换不卸载本地模型），按当前模式取用
-_BACKENDS = {"local": LocalBackend(), "api": OpenAICompatBackend()}
+# 单用户本地应用：三种后端常驻（切换不卸载已加载模型），按当前模式取用
+_BACKENDS = {
+    "local": LocalBackend(),
+    "llamacpp": LlamaCppBackend(),
+    "api": OpenAICompatBackend(),
+}
 _ACTIVE = {"kind": "local"}
 
 
@@ -141,9 +145,10 @@ def plot_data(token_ppls, window=10):
 
 
 # ==================================================================== 事件处理器
-def on_load_model(mode, model_path, base_url, api_key, api_model):
-    """按模式加载：local=本地模型；api=OpenAI 兼容 API 连接验证。"""
-    backend = _BACKENDS["api"] if mode == "api" else _BACKENDS["local"]
+def on_load_model(mode, model_path, base_url, api_key, api_model,
+                  llama_path, llama_gpu, llama_ctx):
+    """按模式加载：local=本地模型；llamacpp=GGUF 量化模型；api=OpenAI 兼容 API。"""
+    backend = _BACKENDS["api"] if mode == "api" else _BACKENDS[mode or "local"]
     if mode == "api":
         yield {model_status: f"⏳ 正在连接 API：{base_url} …"}
         try:
@@ -157,6 +162,26 @@ def on_load_model(mode, model_path, base_url, api_key, api_model):
             }
         except Exception as e:  # noqa: BLE001
             yield {model_status: f"❌ API 连接失败：{e}"}
+        return
+    if mode == "llamacpp":
+        path = (llama_path or "").strip()
+        if not path:
+            yield {model_status: "❌ 请先填写 GGUF 模型路径或 HF GGUF 仓库 ID"}
+            return
+        yield {model_status: f"⏳ 正在加载 GGUF 量化模型：{path} …"}
+        try:
+            backend.load(path, n_gpu_layers=int(llama_gpu), n_ctx=int(llama_ctx))
+            _ACTIVE["kind"] = "llamacpp"
+            yield {
+                model_status: (
+                    f"✅ 已加载：{backend.model_name}"
+                    + (f"｜{backend.quant_info}" if backend.quant_info else "")
+                    + f"｜设备：{backend.device}｜上下文：{backend.context_size}"
+                    "｜逐 token / 上下文困惑度均可用"
+                )
+            }
+        except Exception as e:  # noqa: BLE001
+            yield {model_status: f"❌ 加载失败：{e}"}
         return
     path = (model_path or "").strip()
     if not path:
@@ -214,9 +239,10 @@ def on_generate(blocks, active_text, enabled_skill_names, skills_list,
     }
 
     try:
-        # 上下文困惑度仅本地模式可用（API 不返回 prompt token 概率）
+        # 上下文困惑度：本地 transformers / llama.cpp 模式可用（API 不返回
+        # prompt token 概率）
         ctx_ppl_val = None
-        if backend.kind == "local":
+        if backend.kind in ("local", "llamacpp"):
             ctx_ppl = backend.compute_context_ppl(prompt)
             ctx_ppl_val = round(ctx_ppl, 2) if ctx_ppl == ctx_ppl else None
         yield {
@@ -250,7 +276,7 @@ def on_generate(blocks, active_text, enabled_skill_names, skills_list,
                     f"｜本轮 token：{len(upd.token_ppls)}"
                     f"｜累计着色：{len(all_ppls)}｜"
                     f"平均困惑度：{avg_ppl_of(all_ppls) or 0:.2f}"
-                    + (f"｜{cache_note}" if cache_note and backend.kind == "local" else "")
+                    + (f"｜{cache_note}" if cache_note and backend.kind in ("local", "llamacpp") else "")
                 ),
             }
     except Exception as e:  # noqa: BLE001
@@ -427,6 +453,7 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
     # 顶栏：后端模式 + 模型加载
     backend_mode_rd = gr.Radio(
         choices=[("🏠 本地模型（transformers）", "local"),
+                 ("🦙 llama.cpp（GGUF 量化模型）", "llamacpp"),
                  ("☁️ OpenAI 兼容 API", "api")],
         value="local",
         label="后端模式",
@@ -440,6 +467,30 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
                 scale=3,
             )
             load_btn = gr.Button("加载模型", variant="primary", scale=1)
+    with gr.Group(visible=False) as llama_cfg_group:
+        gr.Markdown(
+            "<span style='font-size:12px;color:#888'>进程内加载 llama.cpp 量化模型"
+            "（Q4_K_M / Q5_K_M / Q8_0 / IQ 系列等 GGUF）：小显存/纯 CPU 也能跑大模型。"
+            "路径填本地 .gguf 文件（如 models/qwen2.5-0.5b-instruct-q4_k_m.gguf）"
+            "或 HF GGUF 仓库 ID（如 Qwen/Qwen2.5-0.5B-Instruct-GGUF，首次自动下载）。"
+            "需已安装 llama-cpp-python：pip install llama-cpp-python</span>"
+        )
+        with gr.Row():
+            llama_path_tb = gr.Textbox(
+                label="GGUF 模型路径 / HF 仓库 ID",
+                value="", placeholder="models/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+                scale=3,
+            )
+            llama_load_btn = gr.Button("加载 GGUF", variant="primary", scale=1)
+        with gr.Row():
+            llama_gpu_sl = gr.Slider(
+                -1, 100, value=-1, step=1,
+                label="n_gpu_layers（GPU offload 层数；-1=全部，0=纯 CPU）",
+            )
+            llama_ctx_sl = gr.Slider(
+                512, 32768, value=4096, step=512,
+                label="n_ctx（上下文窗口 / KV cache 容量）",
+            )
     with gr.Group(visible=False) as api_cfg_group:
         gr.Markdown(
             "<span style='font-size:12px;color:#888'>兼容 OpenAI / DeepSeek / "
@@ -614,15 +665,21 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
                 autosave_tb = gr.Textbox(label="自动保存记录", value="", interactive=False, scale=3)
 
     # ---------------------------------------------------------------- 事件接线
-    _load_inputs = [backend_mode_rd, model_path_tb, api_base_tb, api_key_tb, api_model_tb]
+    _load_inputs = [backend_mode_rd, model_path_tb, api_base_tb, api_key_tb,
+                    api_model_tb, llama_path_tb, llama_gpu_sl, llama_ctx_sl]
     load_btn.click(on_load_model, inputs=_load_inputs, outputs=[model_status])
     api_load_btn.click(on_load_model, inputs=_load_inputs, outputs=[model_status])
+    llama_load_btn.click(on_load_model, inputs=_load_inputs, outputs=[model_status])
 
     def _switch_backend_mode(mode):
-        return (gr.Group(visible=mode == "local"), gr.Group(visible=mode == "api"))
+        return (
+            gr.Group(visible=mode == "local"),
+            gr.Group(visible=mode == "llamacpp"),
+            gr.Group(visible=mode == "api"),
+        )
 
     backend_mode_rd.change(_switch_backend_mode, inputs=[backend_mode_rd],
-                           outputs=[local_cfg_group, api_cfg_group])
+                           outputs=[local_cfg_group, llama_cfg_group, api_cfg_group])
 
     generate_btn.click(
         on_generate,

@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """生成式文本编辑器 — 无头 REST/SSE 服务（供 VSCode 插件等前端使用）。
 
-复用 backend.py（本地 transformers / OpenAI 兼容双后端）与 core.py
-（文档序列化、上下文组装、困惑度聚合），默认监听 127.0.0.1:8907。
+复用 backend.py（本地 transformers / llama.cpp GGUF / OpenAI 兼容三后端）与
+core.py（文档序列化、上下文组装、困惑度聚合），默认监听 127.0.0.1:8907。
 
 端点：
 - GET  /api/status   {kind, loaded, loading, message, generating}
 - POST /api/load     {mode, model_path} 或 {mode, base_url, api_key, model}
+                     或 {mode, model_path, n_gpu_layers, n_ctx}（mode=llamacpp）
                      → 立即返回 {accepted:true}，实际加载在后台线程，结果经
                        /api/status 的 loading/message 反映（轮询）
 - POST /api/generate {blocks, active_text, skills, params, context_mode}
@@ -22,7 +23,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from backend import LocalBackend, OpenAICompatBackend
+from backend import LlamaCppBackend, LocalBackend, OpenAICompatBackend
 from core import build_prompt
 from skills import scan_skills, skills_to_context
 
@@ -30,8 +31,12 @@ DEFAULT_HOST, DEFAULT_PORT = "127.0.0.1", 8907
 
 app = FastAPI(title="Generative Text Editor Server")
 
-# 单用户本地应用：两种后端常驻（切换不卸载本地模型），按当前模式取用
-_BACKENDS = {"local": LocalBackend(), "api": OpenAICompatBackend()}
+# 单用户本地应用：三种后端常驻（切换不卸载已加载模型），按当前模式取用
+_BACKENDS = {
+    "local": LocalBackend(),
+    "llamacpp": LlamaCppBackend(),
+    "api": OpenAICompatBackend(),
+}
 _ACTIVE = {"kind": "local"}
 
 
@@ -50,6 +55,8 @@ class LoadRequest(BaseModel):
     base_url: str = ""
     api_key: str = ""
     model: str = ""
+    n_gpu_layers: int = -1   # llamacpp：GPU offload 层数（-1=全部，0=纯 CPU）
+    n_ctx: int = 4096        # llamacpp：上下文窗口
 
 
 class GenParams(BaseModel):
@@ -89,6 +96,10 @@ def load(req: LoadRequest):
     if mode == "api":
         if not (req.base_url and req.model):
             return JSONResponse({"error": "base_url 与 model 不能为空"}, status_code=400)
+    elif mode not in _BACKENDS:
+        return JSONResponse(
+            {"error": f"未知后端模式：{mode}（可选 local/llamacpp/api）"}, status_code=400
+        )
     elif not (req.model_path or "").strip():
         return JSONResponse({"error": "model_path 不能为空"}, status_code=400)
 
@@ -100,19 +111,31 @@ def load(req: LoadRequest):
 
 def _load_worker(mode: str, req: LoadRequest):
     """后台加载线程：完成后把结果写入 _LOADING（status 轮询展示）。"""
-    backend = _BACKENDS["api"] if mode == "api" else _BACKENDS["local"]
+    backend = _BACKENDS.get(mode) or _BACKENDS["local"]
     try:
-        _LOADING["message"] = (
-            f"⏳ 正在连接 API：{req.base_url} …" if mode == "api"
-            else f"⏳ 正在加载模型：{req.model_path} （首次会自动下载，请耐心等待）"
-        )
         if mode == "api":
+            _LOADING["message"] = f"⏳ 正在连接 API：{req.base_url} …"
             backend.load(req.base_url, req.api_key, req.model)
+        elif mode == "llamacpp":
+            _LOADING["message"] = (
+                f"⏳ 正在加载 GGUF 量化模型：{req.model_path} …"
+            )
+            backend.load(
+                req.model_path,
+                n_gpu_layers=req.n_gpu_layers,
+                n_ctx=req.n_ctx,
+            )
         else:
+            _LOADING["message"] = (
+                f"⏳ 正在加载模型：{req.model_path} （首次会自动下载，请耐心等待）"
+            )
             backend.load(req.model_path)
         _ACTIVE["kind"] = mode
         _LOADING["message"] = (
             f"✅ API 已连接：{backend.model} @ {backend.base_url}" if mode == "api"
+            else f"✅ 已加载：{backend.model_name}｜{backend.quant_info}｜"
+                 f"设备：{backend.device}｜上下文：{backend.context_size}"
+            if mode == "llamacpp"
             else f"✅ 已加载：{backend.model_name}｜设备：{backend.device}"
         )
     except Exception as e:  # noqa: BLE001
@@ -167,8 +190,8 @@ def generate(req: GenerateRequest):
 
     def _stream():
         try:
-            # 上下文困惑度仅本地模式可用
-            if backend.kind == "local":
+            # 上下文困惑度：本地 transformers / llama.cpp 模式可用（API 不可用）
+            if backend.kind in ("local", "llamacpp"):
                 try:
                     ctx = backend.compute_context_ppl(prompt)
                     ctx = round(ctx, 2) if ctx == ctx else None
@@ -184,7 +207,7 @@ def generate(req: GenerateRequest):
                     "token_texts": upd.token_texts,
                     "token_ppls": upd.token_ppls,
                     "final": upd.final,
-                    "cache_info": cache_note if backend.kind == "local" else "",
+                    "cache_info": cache_note if backend.kind in ("local", "llamacpp") else "",
                 })
         except Exception as e:  # noqa: BLE001
             yield _sse_event("error", {"error": str(e)})

@@ -91,17 +91,27 @@ svg { width: 100%; height: 130px; }
     <div class="row"><label>模式</label>
       <select id="mode">
         <option value="local">本地模型（transformers）</option>
+        <option value="llamacpp">llama.cpp（GGUF 量化）</option>
         <option value="api">OpenAI 兼容 API</option>
       </select>
     </div>
     <div id="localRow" class="row"><label>模型路径/ID</label>
       <input type="text" id="modelPath" value="Qwen/Qwen2.5-0.5B-Instruct"></div>
+    <div id="llamaRow" class="row" style="display:none"><label>GGUF 路径/仓库</label>
+      <input type="text" id="llamaPath" placeholder="models/qwen2.5-0.5b-instruct-q4_k_m.gguf"></div>
+    <div id="llamaRow2" class="row" style="display:none"><label>n_gpu_layers</label>
+      <input type="number" id="llamaGpu" value="-1" min="-1" max="100" step="1"></div>
+    <div id="llamaRow3" class="row" style="display:none"><label>n_ctx</label>
+      <input type="number" id="llamaCtx" value="4096" min="512" max="32768" step="512"></div>
     <div id="apiRow" class="row" style="display:none"><label>base_url</label>
       <input type="text" id="apiBase" value="https://api.openai.com/v1"></div>
     <div id="apiRow2" class="row" style="display:none"><label>API Key</label>
       <input type="password" id="apiKey"></div>
     <div id="apiRow3" class="row" style="display:none"><label>模型名</label>
       <input type="text" id="apiModel" value="gpt-4o-mini"></div>
+    <div id="llamaTip" class="tip" style="display:none">
+      本地 .gguf 文件路径或 HF GGUF 仓库 ID（自动下载）。n_gpu_layers：-1=全部层上 GPU，0=纯 CPU。
+    </div>
     <button id="loadBtn">加载 / 连接</button>
     <div class="status" id="status">未加载</div>
   </div>
@@ -152,7 +162,12 @@ const $ = (id) => document.getElementById(id);
 
 function setMode(m) {
   const api = m === "api";
-  $("localRow").style.display = api ? "none" : "";
+  const llama = m === "llamacpp";
+  $("localRow").style.display = api || llama ? "none" : "";
+  $("llamaRow").style.display = llama ? "" : "none";
+  $("llamaRow2").style.display = llama ? "" : "none";
+  $("llamaRow3").style.display = llama ? "" : "none";
+  $("llamaTip").style.display = llama ? "" : "none";
   $("apiRow").style.display = api ? "" : "none";
   $("apiRow2").style.display = api ? "" : "none";
   $("apiRow3").style.display = api ? "" : "none";
@@ -177,6 +192,12 @@ $("loadBtn").addEventListener("click", () => {
   const mode = $("mode").value;
   if (mode === "local") {
     vscode.postMessage({ type: "load", mode, model_path: $("modelPath").value });
+  } else if (mode === "llamacpp") {
+    vscode.postMessage({
+      type: "load", mode, model_path: $("llamaPath").value,
+      n_gpu_layers: parseInt($("llamaGpu").value, 10) || 0,
+      n_ctx: parseInt($("llamaCtx").value, 10) || 4096,
+    });
   } else {
     vscode.postMessage({
       type: "load", mode, base_url: $("apiBase").value,
@@ -243,7 +264,7 @@ window.addEventListener("message", (ev) => {
     $("pRep").value = msg.params.repetition_penalty;
     $("pMode").value = msg.context_mode || "chat";
   } else if (msg.type === "ppl") {
-    $("ctxPpl").textContent = msg.ctxPpl == null ? "—（仅本地模式）" : String(msg.ctxPpl);
+    $("ctxPpl").textContent = msg.ctxPpl == null ? "—（本地/llama.cpp 模式）" : String(msg.ctxPpl);
     $("avgPpl").textContent = msg.avgPpl == null ? "—" : msg.avgPpl.toFixed(2);
     $("cacheInfo").textContent = msg.cacheInfo || "";
     drawChart(msg.series);
