@@ -572,7 +572,11 @@ var GenerationController = class {
     state.activePpl = seg;
     const { params, context_mode, skills } = this.cb.getRequestState();
     const req = {
-      blocks: parsed.blocks.map((b) => ({ type: b.type, content: b.content })),
+      // 服务端契约：blocks 尾部须为活动 <generate> 块（active 由服务端从最后一块推导）
+      blocks: [
+        ...parsed.blocks.map((b) => ({ type: b.type, content: b.content })),
+        { type: "generate", content: activeText }
+      ],
       active_text: activeText,
       skills,
       params,
