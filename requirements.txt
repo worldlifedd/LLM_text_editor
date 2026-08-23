@@ -5,3 +5,5 @@ accelerate
 gradio>=5.0
 sentencepiece
 pyyaml
+fastapi
+uvicorn

@@ -2,6 +2,10 @@
 
 基于 LLM 的分块式生成文本编辑器：提示词块引导生成，生成块流式续写、可随时暂停与手动编辑。类 Jupyter 的交互体验，专为"人机协作写作"设计。
 
+提供两种前端，共享同一套后端与文档模型：
+- **Gradio 网页前端**（`app.py`）：浏览器内编辑，带全量困惑度可视化
+- **VSCode 插件前端**（`vscode-extension/`）：在 Markdown 里用 `<prompt>` / `<generate>` 标签写作，习惯 VSCode 编辑的用户首选
+
 ## 功能特性
 
 ### 分块文档编辑
@@ -57,7 +61,11 @@ pip install -r requirements.txt
 
 # HuggingFace 无法直连时可使用镜像
 set HF_ENDPOINT=https://hf-mirror.com
+```
 
+### 方式一：Gradio 网页前端
+
+```bash
 python app.py
 # 浏览器打开 http://127.0.0.1:7860
 ```
@@ -66,20 +74,81 @@ python app.py
 - **本地模型**：填写模型路径或 HF ID（默认 `Qwen/Qwen2.5-0.5B-Instruct`），点击「加载模型」
 - **API**：填写 base_url（到 `/v1` 层级）、API Key、模型名，点击「连接 API」
 
+### 方式二：VSCode 插件前端
+
+1. 启动无头服务（也可不手动启动，插件默认自动拉起）：
+
+   ```bash
+   python server.py            # 默认监听 127.0.0.1:8907
+   # 可选参数：python server.py --host 0.0.0.0 --port 8907
+   ```
+
+2. 安装插件：在 VSCode 中「扩展」→「…」→「从 VSIX 安装」，或按 F5 调试运行
+   （`vscode-extension/` 目录内先执行 `npm install`，随后 `npm run compile` 或直接调试）
+
+3. 在侧边栏 **GTE 生成控制面板** 中连接服务、加载模型 / 连接 API、勾选技能并调整生成参数
+
+#### 文档格式
+
+插件以 Markdown 为文档载体，`<prompt>` 与 `<generate>` 标签划分块：
+
+```markdown
+<prompt>
+写一段关于秋天的散文开头，100字左右。
+</prompt>
+
+<generate>
+秋日的午后，阳光穿过梧桐叶洒在青石板上……
+</generate>
+```
+
+生成仅发生在**最后一块生成块**（活动生成单元）中：文档末尾没有 `<generate>` 块时按 `Ctrl+Enter` 会自动创建。
+
+#### 命令与快捷键
+
+| 命令 | 快捷键 | 说明 |
+|---|---|---|
+| `GTE: 生成（续写当前生成块）` | `Ctrl+Enter` | 从光标后开始流式生成 |
+| `GTE: 停止生成` | `Ctrl+Alt+Enter` | 停止当前生成，保留已生成文本 |
+| `GTE: 定稿当前块并开启新块` | `Ctrl+Shift+Enter` | 锁定前序块、开启新的活动生成块 |
+| `GTE: 追加提示词块` | — | 在文档末尾追加 `<prompt>` 块 |
+| `GTE: 锁定/解锁光标所在块` | — | 折叠该块，防止误编辑 |
+| `GTE: 新建生成式文本文档` | — | 打开带初始模板的新 Markdown 文档 |
+| `GTE: 打开生成控制面板` | — | 聚焦侧边栏控制面板 |
+
+流式生成的 token 按困惑度着色（绿=确定、红=困惑），手动编辑后颜色自动灰显回退。
+
+#### 插件配置
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `gte.serverUrl` | `http://127.0.0.1:8907` | 无头服务地址 |
+| `gte.autoStartServer` | `true` | 服务不可达时自动用 python 拉起 server.py |
+| `gte.pythonCommand` | `python` | 启动 server.py 所用 Python 命令 |
+| `gte.serverScript` | 自动查找 | server.py 绝对路径（工作区 / 扩展目录） |
+| `gte.params` | 见面板 | 生成参数默认值 |
+
 ## 项目结构
 
 ```
 ├── app.py            # Gradio 前端：分块编辑、困惑度可视化、技能库面板
+├── server.py         # FastAPI 无头服务：REST + SSE，供 VSCode 插件等前端使用
+├── core.py           # 共享纯逻辑：文档序列化、上下文组装、困惑度聚合
 ├── backend.py        # LLM 后端：LocalBackend（KV缓存）/ OpenAICompatBackend（SSE）
 ├── skills.py         # 技能扫描、解析（SKILL.md frontmatter）、上下文拼接
 ├── skills/           # 技能库目录
 │   └── 中文散文写作/SKILL.md
 ├── saves/            # 文档保存目录（运行时生成）
+├── vscode-extension/ # VSCode 插件前端
+│   ├── src/          # 插件源码（TS）：extension/generation/docmodel/panel/… 
+│   ├── package.json  # 命令、快捷键、配置项声明
+│   └── esbuild.js    # 打包脚本
 ├── requirements.txt
 ├── kv_cache_test.py      # KV 缓存回归：命中加速/贪心一致性/停止后再生成
 ├── ppl_accum_test.py     # 困惑度累积回归：跨块/编辑容错/序列化兼容
 ├── lock_autosave_test.py # 块锁定 + 定时自动保存逻辑回归
-└── regress3_test.py      # 服务器 REST 回归（需 app.py 已启动）
+├── regress3_test.py      # 服务器 REST 回归（需 app.py 已启动）
+└── server_test.py        # 无头服务 REST/SSE 回归（需 server.py 已启动）
 ```
 
 ## 已知约束

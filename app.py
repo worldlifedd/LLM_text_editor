@@ -9,12 +9,20 @@ import glob
 import html
 import math
 import os
-import re
 
 import gradio as gr
 import pandas as pd
 
 from backend import LocalBackend, OpenAICompatBackend
+from core import (
+    avg_ppl_of,
+    blocks_ppls,
+    build_prompt,
+    parse_doc,
+    ppl_color,
+    reconcile_active_ppl,
+    serialize_doc,
+)
 from skills import SKILLS_DIR, import_skill_file, scan_skills, skills_to_context
 
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saves")
@@ -28,78 +36,11 @@ def _backend():
     return _BACKENDS[_ACTIVE["kind"]]
 
 
-# ==================================================================== 文档序列化
-def serialize_doc(blocks, active_text):
-    """历史块 + 活动单元（作为最后一个 generate 块）→ Markdown + XML 文本。"""
-    parts = []
-    for blk in blocks:
-        tag = "prompt" if blk["type"] == "prompt" else "generate"
-        parts.append(f"<{tag}>\n{blk['content'].strip()}\n</{tag}>")
-    if active_text.strip():
-        parts.append(f"<generate>\n{active_text.strip()}\n</generate>")
-    return "\n\n".join(parts) + "\n"
-
-
-def parse_doc(text):
-    """解析 Markdown+XML 文本 → (blocks, active_text)。最后一个 generate 进活动单元。"""
-    blocks = []
-    for m in re.finditer(r"<(prompt|generate)>\s*(.*?)\s*</\1>", text, re.S):
-        blocks.append({"type": m.group(1), "content": m.group(2).strip()})
-    active = ""
-    if blocks and blocks[-1]["type"] == "generate":
-        active = blocks[-1]["content"]
-        blocks = blocks[:-1]
-    return blocks, active
-
-
 # ==================================================================== 困惑度可视化
-_LOG_PPL_MIN, _LOG_PPL_MAX = 0.0, math.log(200.0)
-
 # 活动生成单元的逐 token 困惑度：token_texts 拼接恒等于活动块当前文本，
 # ppls 中 None 表示该段无数据（手动编辑区域），渲染为灰色。定稿
 # （on_add_generate）时随块存入 block["ppl"]，覆盖全部生成块。
 _ACTIVE_PPL = {"token_texts": [], "token_ppls": []}
-
-
-def _reconcile_active_ppl(base):
-    """着色对账：活动块被手动编辑后，仅保留与新文本公共字符前缀内完整
-    token 的着色；编辑点及之后的旧文本合并为单个无数据段(ppl=None)。
-    返回 (token_texts, token_ppls)，二者拼接覆盖整个 base。"""
-    texts, ppls = _ACTIVE_PPL["token_texts"], _ACTIVE_PPL["token_ppls"]
-    if not texts:
-        return [], []
-    cov = "".join(texts)
-    if base.startswith(cov):
-        return list(texts), list(ppls)
-    k, n = 0, min(len(cov), len(base))
-    while k < n and cov[k] == base[k]:
-        k += 1
-    kept_t, kept_p, acc = [], [], 0
-    for t, p in zip(texts, ppls):
-        if acc + len(t) <= k:  # 仅保留完整落在公共前缀内的 token
-            kept_t.append(t)
-            kept_p.append(p)
-            acc += len(t)
-        else:
-            break
-    rest = base[acc:]
-    if rest:
-        kept_t.append(rest)
-        kept_p.append(None)
-    return kept_t, kept_p
-
-
-def ppl_color(ppl):
-    """log(ppl) 在 [0, log200] clamp 后经 绿→黄→红 三锚点插值，返回 rgba 字符串。"""
-    t = (math.log(max(ppl, 1.0001)) - _LOG_PPL_MIN) / (_LOG_PPL_MAX - _LOG_PPL_MIN)
-    t = min(max(t, 0.0), 1.0)
-    anchors = [(134, 226, 148), (255, 226, 130), (255, 118, 108)]  # 绿 → 黄 → 红
-    if t < 0.5:
-        a, b, u = anchors[0], anchors[1], t * 2
-    else:
-        a, b, u = anchors[1], anchors[2], (t - 0.5) * 2
-    rgb = tuple(round(a[i] + (b[i] - a[i]) * u) for i in range(3))
-    return f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.45)"
 
 
 def _mixed_spans(token_texts, token_ppls):
@@ -116,18 +57,6 @@ def _mixed_spans(token_texts, token_ppls):
 
 _GRAY_BG = "background:rgba(160,160,160,0.18);color:#777"
 _BLOCK_SEP = '<span style="color:#c8c8c8;margin:0 3px;user-select:none">▍</span>'
-
-
-def _blocks_ppls(blocks):
-    """全部生成块的累计 ppl 序列（历史冻结块 + 活动块，不含无数据段）。"""
-    ppls = []
-    for b in blocks or []:
-        if b.get("type") != "generate":
-            continue
-        seg = b.get("ppl") or {}
-        ppls.extend(p for p in (seg.get("token_ppls") or []) if p is not None)
-    ppls.extend(p for p in _ACTIVE_PPL["token_ppls"] if p is not None)
-    return ppls
 
 
 def doc_heatmap_html(blocks, active_text):
@@ -211,70 +140,6 @@ def plot_data(token_ppls, window=10):
     return pd.DataFrame(rows)
 
 
-def avg_ppl_of(token_ppls):
-    """几何平均困惑度；无数据返回 None。"""
-    if not token_ppls:
-        return None
-    return math.exp(sum(math.log(max(p, 1e-9)) for p in token_ppls) / len(token_ppls))
-
-
-# ==================================================================== 上下文组装
-def blocks_to_messages(blocks, skill_ctx):
-    """文档块 → chat 消息列表。prompt→user、generate→assistant，
-    相邻同角色块合并（chat 模板不允许连续同角色消息）。"""
-    msgs = []
-    if skill_ctx:
-        msgs.append({"role": "system", "content": skill_ctx})
-    for blk in blocks or []:
-        c = blk["content"].strip()
-        if not c:
-            continue
-        role = "user" if blk["type"] == "prompt" else "assistant"
-        if msgs and msgs[-1]["role"] == role:
-            msgs[-1]["content"] += "\n\n" + c
-        else:
-            msgs.append({"role": role, "content": c})
-    return msgs
-
-
-def build_flat_context(blocks, active_text, skill_ctx, mode):
-    """prefix / raw 模式的平文本上下文。"""
-    parts = [skill_ctx] if skill_ctx else []
-    if mode == "prefix":
-        for blk in blocks:
-            c = blk["content"].strip()
-            if not c:
-                continue
-            tag = "指令" if blk["type"] == "prompt" else "正文"
-            parts.append(f"【{tag}】\n{c}")
-    else:  # raw
-        parts.extend(b["content"].strip() for b in blocks if b["content"].strip())
-    if active_text:
-        parts.append(active_text)
-    return "\n\n".join(parts)
-
-
-def build_prompt(blocks, active_text, skill_ctx, mode, backend):
-    """构造 backend 专属 prompt。
-
-    上下文模式：
-    - chat:   提示词块→user 指令、生成块→assistant 回复（本地=聊天模板
-              包装文本；API=messages 列表）
-    - prefix: 提示词块加【指令】前缀、生成块加【正文】前缀后拼接
-    - raw:    全部块原文裸拼接（纯续写场景）
-    """
-    blocks = blocks or []
-    active = (active_text or "").strip()
-    skill = skill_ctx or ""
-    if mode == "chat":
-        msgs = blocks_to_messages(blocks, skill)
-        if not any(m["role"] == "user" for m in msgs):
-            return ""  # chat 模式必须有指令，否则退化为无意义模板
-        return backend.build_chat_prompt(msgs, active)
-    flat = build_flat_context(blocks, active, skill, mode)
-    return backend.build_flat_prompt(flat)
-
-
 # ==================================================================== 事件处理器
 def on_load_model(mode, model_path, base_url, api_key, api_model):
     """按模式加载：local=本地模型；api=OpenAI 兼容 API 连接验证。"""
@@ -333,12 +198,14 @@ def on_generate(blocks, active_text, enabled_skill_names, skills_list,
 
     base = active_text or ""
     # 对账：编辑点之前的着色保留，编辑区域及之后合并为无数据段(None)
-    seg_t, seg_p = _reconcile_active_ppl(base)
+    seg_t, seg_p = reconcile_active_ppl(
+        _ACTIVE_PPL["token_texts"], _ACTIVE_PPL["token_ppls"], base
+    )
     _ACTIVE_PPL["token_texts"], _ACTIVE_PPL["token_ppls"] = seg_t, seg_p
     blocks = blocks or []
 
     n_skills = len(enabled)
-    all_ppls = _blocks_ppls(blocks)
+    all_ppls = blocks_ppls(blocks, _ACTIVE_PPL["token_ppls"])
     yield {
         status_tb: f"⏳ 正在计算上下文困惑度…（启用技能 {n_skills} 个）",
         avg_ppl_num: round(avg_ppl_of(all_ppls) or 0.0, 2) if all_ppls else None,
@@ -370,7 +237,7 @@ def on_generate(blocks, active_text, enabled_skill_names, skills_list,
             # 累积：对账后的基线覆盖段 + 本轮新 token（拼接恒等于 full_text）
             _ACTIVE_PPL["token_texts"] = seg_t + list(upd.token_texts)
             _ACTIVE_PPL["token_ppls"] = seg_p + list(upd.token_ppls)
-            all_ppls = _blocks_ppls(blocks)
+            all_ppls = blocks_ppls(blocks, _ACTIVE_PPL["token_ppls"])
             cache_note = getattr(backend, "last_cache_info", "")
             yield {
                 active_cell_tb: full_text,
@@ -427,7 +294,7 @@ def on_add_generate(blocks, active_text):
     for b in blocks[:-1]:
         b.setdefault("locked", True)
     _ACTIVE_PPL["token_texts"], _ACTIVE_PPL["token_ppls"] = [], []
-    all_ppls = _blocks_ppls(blocks)
+    all_ppls = blocks_ppls(blocks, _ACTIVE_PPL["token_ppls"])
     return {
         blocks_state: blocks,
         active_cell_tb: "",

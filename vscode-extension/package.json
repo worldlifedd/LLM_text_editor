@@ -1,0 +1,140 @@
+{
+  "name": "gte-editor",
+  "displayName": "GTE 生成式文本编辑器",
+  "description": "基于 LLM 的分块式生成文本编辑器：提示词块引导生成，生成块流式续写、可暂停可手动编辑。",
+  "version": "0.1.0",
+  "publisher": "trae-local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gte.generate",
+        "title": "GTE: 生成（续写当前生成块）",
+        "category": "GTE"
+      },
+      {
+        "command": "gte.stop",
+        "title": "GTE: 停止生成",
+        "category": "GTE"
+      },
+      {
+        "command": "gte.finalizeBlock",
+        "title": "GTE: 定稿当前块并开启新块",
+        "category": "GTE"
+      },
+      {
+        "command": "gte.addPromptBlock",
+        "title": "GTE: 追加提示词块",
+        "category": "GTE"
+      },
+      {
+        "command": "gte.toggleLock",
+        "title": "GTE: 锁定/解锁光标所在块",
+        "category": "GTE"
+      },
+      {
+        "command": "gte.newDocument",
+        "title": "GTE: 新建生成式文本文档",
+        "category": "GTE"
+      },
+      {
+        "command": "gte.showPanel",
+        "title": "GTE: 打开生成控制面板",
+        "category": "GTE"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "gte.generate",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && editorLangId == markdown"
+      },
+      {
+        "command": "gte.stop",
+        "key": "ctrl+alt+enter",
+        "mac": "cmd+alt+enter",
+        "when": "editorTextFocus && editorLangId == markdown"
+      },
+      {
+        "command": "gte.finalizeBlock",
+        "key": "ctrl+shift+enter",
+        "mac": "cmd+shift+enter",
+        "when": "editorTextFocus && editorLangId == markdown"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "gte",
+          "title": "GTE 生成式文本编辑器",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "gte": [
+        {
+          "type": "webview",
+          "id": "gte.panel",
+          "name": "生成控制面板"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "GTE",
+      "properties": {
+        "gte.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8907",
+          "description": "无头服务地址（python server.py 默认端口 8907）"
+        },
+        "gte.autoStartServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "服务不可达时自动用 python 拉起 server.py"
+        },
+        "gte.pythonCommand": {
+          "type": "string",
+          "default": "python",
+          "description": "启动 server.py 所用的 Python 命令"
+        },
+        "gte.serverScript": {
+          "type": "string",
+          "default": "",
+          "description": "server.py 绝对路径；留空则自动在工作区与扩展目录查找"
+        },
+        "gte.params": {
+          "type": "object",
+          "default": {
+            "max_new_tokens": 256,
+            "do_sample": true,
+            "temperature": 0.8,
+            "top_k": 50,
+            "top_p": 0.95,
+            "repetition_penalty": 1.1,
+            "context_mode": "chat"
+          },
+          "description": "生成参数默认值（可在面板中覆盖）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.js && tsc --noEmit -p tsconfig.json",
+    "watch": "node esbuild.js --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  }
+}
