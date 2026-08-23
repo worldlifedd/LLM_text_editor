@@ -34,11 +34,13 @@ function findServerScript(): string | null {
   const cfg = vscode.workspace.getConfiguration("gte");
   const explicit = cfg.get<string>("serverScript");
   if (explicit) return explicit;
-  // 扩展目录内随 VSIX 打包的 Python 服务端（自包含，优先）
-  const extRoot = path.dirname(path.dirname(__dirname));
+  // 扩展根目录：打包后 __dirname 为 <ext>/dist，其上级即扩展根（含 python/）
+  // 注意不能再用 dirname(dirname(...))——那会得到 .vscode/extensions（上级的上级）
+  const extRoot = path.dirname(__dirname);
   const candidates = [
     path.join(extRoot, "python", "server.py"),
     path.join(extRoot, "server.py"),
+    // 开发态（F5，esbuild 输出到 vscode-extension/dist 时）仓库根在扩展目录上级
     path.join(extRoot, "..", "server.py"),
     path.join(extRoot, "src", "server.py"),
   ];

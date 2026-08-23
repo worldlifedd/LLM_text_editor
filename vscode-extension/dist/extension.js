@@ -61,10 +61,11 @@ function findServerScript() {
   const explicit = cfg.get("serverScript");
   if (explicit)
     return explicit;
-  const extRoot = path.dirname(path.dirname(__dirname));
+  const extRoot = path.dirname(__dirname);
   const candidates = [
     path.join(extRoot, "python", "server.py"),
     path.join(extRoot, "server.py"),
+    // 开发态（F5，esbuild 输出到 vscode-extension/dist 时）仓库根在扩展目录上级
     path.join(extRoot, "..", "server.py"),
     path.join(extRoot, "src", "server.py")
   ];

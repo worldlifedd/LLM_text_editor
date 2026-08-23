@@ -2,7 +2,7 @@
   "name": "gte-editor",
   "displayName": "GTE 生成式文本编辑器",
   "description": "基于 LLM 的分块式生成文本编辑器：提示词块引导生成，生成块流式续写、可暂停可手动编辑。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "trae-local",
   "license": "MIT",
   "engines": {
