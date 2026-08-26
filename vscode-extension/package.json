@@ -5,6 +5,10 @@
   "version": "0.1.2",
   "publisher": "trae-local",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/worldlifedd/LLM_text_editor"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
