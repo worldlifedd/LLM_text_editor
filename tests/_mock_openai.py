@@ -1,7 +1,11 @@
 # 临时 Mock OpenAI 兼容服务：验证 server.py 的 API 后端 generate SSE 链路。
 # 监听 127.0.0.1:8999/v1/chat/completions，流式返回若干 chunk（含 logprobs）。
 import json
+import os
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse

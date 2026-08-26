@@ -2,7 +2,10 @@
 """块锁定 + 定时自动保存逻辑验证（无需模型/服务器）。"""
 import glob
 import os
+import sys
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app
 

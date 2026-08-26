@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """服务器回归：加载 + 连续两次生成（验证缓存路径在 UI 链路正常）。"""
 import json
+import os
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import requests
 
