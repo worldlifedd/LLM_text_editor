@@ -4,7 +4,11 @@
 用法：先启动 `python server.py`，再运行本脚本。
 """
 import json
+import os
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import requests
 

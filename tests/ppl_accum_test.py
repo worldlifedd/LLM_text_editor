@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
 """困惑度跨块累积验证：两轮生成 + 定稿冻结 + 累积展示 + 编辑失效。"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import app
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"

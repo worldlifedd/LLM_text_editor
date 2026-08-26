@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """KV 前缀缓存回归：命中加速 / 贪心一致性 / 中途编辑 / 停止后再生成。"""
+import os
+import sys
 import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend import LocalBackend
 

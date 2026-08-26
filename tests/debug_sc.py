@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
 """最小复现：StoppingCriteria 是否被调用、scores 形态。"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 

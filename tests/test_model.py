@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """模型级冒烟测试：加载 Qwen2.5-0.5B、流式生成、逐token困惑度对齐、优雅停止。"""
+import os
+import sys
 import time
 
-from backend import LLMBackend
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from backend import LocalBackend
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 print("== 加载模型 ==", flush=True)
 t0 = time.time()
-be = LLMBackend()
+be = LocalBackend()
 be.load(MODEL)
 print(f"loaded on {be.device} in {time.time() - t0:.1f}s", flush=True)
 

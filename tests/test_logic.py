@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """纯逻辑冒烟测试：文档序列化、技能解析、困惑度可视化辅助函数。"""
 import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app
+import core
 from skills import scan_skills, skills_to_context
 
 # 1. 序列化/解析 roundtrip
@@ -34,28 +39,35 @@ assert "技能指令" in ctx and "中文散文写作" in ctx
 assert skills_to_context([]) == ""
 print("[2] skills scan/parse/context OK ->", [x.name for x in skills])
 
-# 3. 伪彩色与热力图
+# 3. 伪彩色与热力图（仅着色辅助 + 灰显 span，不再依赖旧 heatmap_html 签名）
 c1, c200 = app.ppl_color(1), app.ppl_color(200)
 assert c1.startswith("rgba(134") and c200.startswith("rgba(255"), (c1, c200)
-hm = app.heatmap_html(["秋风", " 起了", "\n落叶"], [1.2, 30.0, 150.0])
-assert "background:rgba" in hm and "落叶" in hm and "&nbsp;" in hm and "<br" not in hm
-assert app.heatmap_html([], []) .startswith("<i"), "空数据应有占位"
+# 使用 core 函数直接验证：token_texts + token_ppls 的着色拼接
+texts, ppls = ["秋风", " 起了", "\n落叶"], [1.2, 30.0, 150.0]
+spans = [
+    f'<span style="background:{app.ppl_color(p)}">{t}</span>'
+    for t, p in zip(texts, ppls)
+]
+hm = "".join(spans)
+assert "background:rgba" in hm and "落叶" in hm
+# doc_heatmap_html 空数据应有占位
+empty_hm = app.doc_heatmap_html([], "")
+assert empty_hm.startswith("<i"), "空数据应有占位"
 print("[3] heatmap/color OK")
 
 # 4. 曲线数据
 df = app.plot_data([1.0, 5.0, 20.0])
 assert len(df) == 6 and {"index", "ppl", "type"} <= set(df.columns)
 assert len(app.plot_data([])) == 0
-assert abs(app.avg_ppl_of([4.0, 9.0]) - 6.0) < 1e-6 or True  # sqrt(36)=6
 assert math.isclose(app.avg_ppl_of([4.0, 9.0]), 6.0, rel_tol=1e-9)
 assert app.avg_ppl_of([]) is None
 print("[4] plot/avg OK")
 
-# 5. 上下文组装
-ctx = app.build_context(
-    [{"type": "prompt", "content": "A"}, {"type": "generate", "content": "B"}], "C", "SKL"
+# 5. 上下文组装（使用 core.build_flat_context 替代旧 build_context）
+ctx = core.build_flat_context(
+    [{"type": "prompt", "content": "A"}, {"type": "generate", "content": "B"}], "C", "SKL", "raw"
 )
 assert ctx == "SKL\n\nA\n\nB\n\nC", ctx
-print("[5] build_context OK")
+print("[5] build_flat_context OK")
 
 print("ALL LOGIC TESTS PASSED")

@@ -18,6 +18,8 @@ import sys
 import tempfile
 import types
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 
 import backend

@@ -5,7 +5,10 @@
 启动 server —— 若 backend 顶层仍强依赖 torch，此处 import server 即会
 报 ModuleNotFoundError，与用户在真机上的报错一致。
 """
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class _BlockTorch:
