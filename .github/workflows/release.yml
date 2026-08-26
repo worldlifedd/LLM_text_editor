@@ -41,6 +41,14 @@ jobs:
       - name: Build & Package (.vsix)
         run: npx vsce package --no-dependencies -o gte-editor-${GITHUB_REF_NAME}.vsix
 
+      # VSCE_PAT secret 存在时才发布到 Marketplace；PR 标记版本自动跳过
+      - name: Publish to Marketplace (optional)
+        if: ${{ env.VSCE_PAT != '' && !contains(github.ref_name, '-') }}
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx vsce publish --no-dependencies
+        continue-on-error: true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
