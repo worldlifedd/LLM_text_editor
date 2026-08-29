@@ -52,6 +52,12 @@ export class Decorator {
   private promptBg = vscode.window.createTextEditorDecorationType({
     backgroundColor: "rgba(110,150,255,0.10)",
   });
+  private systemBg = vscode.window.createTextEditorDecorationType({
+    backgroundColor: "rgba(170,120,230,0.10)",
+  });
+  private cotBg = vscode.window.createTextEditorDecorationType({
+    backgroundColor: "rgba(160,160,160,0.10)",
+  });
   private generateBg = vscode.window.createTextEditorDecorationType({
     backgroundColor: "rgba(60,190,120,0.10)",
   });
@@ -103,8 +109,17 @@ export class Decorator {
     const doc = editor.document;
     const heat: Map<vscode.TextEditorDecorationType, vscode.Range[]> = new Map();
     const prompts: vscode.Range[] = [];
+    const systems: vscode.Range[] = [];
+    const cots: vscode.Range[] = [];
     const generates: vscode.Range[] = [];
     const locked: vscode.Range[] = [];
+
+    const active = parsed.active;
+    // 活动 cot 块：blocks 末位是活动生成块，紧邻其前的 cot 为活动思维链
+    const activeCot =
+      active && parsed.blocks[parsed.blocks.length - 2]?.type === "cot"
+        ? parsed.blocks[parsed.blocks.length - 2]
+        : null;
 
     for (const blk of parsed.blocks) {
       const range = new vscode.Range(
@@ -113,6 +128,32 @@ export class Decorator {
       );
       if (blk.type === "prompt") {
         prompts.push(range);
+      } else if (blk.type === "system") {
+        systems.push(range);
+      } else if (blk.type === "cot") {
+        cots.push(range);
+        // 思维链困惑度着色：活动块用 activeCotPpl，定稿块查冻结数据，
+        // 无数据（API 后端/外部加载）保持轻背景不着色
+        if (blk === activeCot) {
+          if (state.activeCotPpl.token_texts.length) {
+            this.tokenSegs(
+              doc,
+              state.activeCotPpl.token_texts,
+              state.activeCotPpl.token_ppls,
+              blk.contentStart,
+              heat
+            );
+          }
+        } else {
+          const fin = state.finalized.get(blk.index);
+          const segOk =
+            fin &&
+            fin.seg.token_texts.length &&
+            "".concat(...fin.seg.token_texts) === blk.content;
+          if (segOk) {
+            this.tokenSegs(doc, fin!.seg.token_texts, fin!.seg.token_ppls, blk.contentStart, heat);
+          }
+        }
       } else {
         generates.push(range);
         // 定稿块困惑度：校验内容匹配后按 token 着色，失配整块灰显
@@ -122,7 +163,8 @@ export class Decorator {
           "".concat(...fin.seg.token_texts) === blk.content;
         if (segOk) {
           this.tokenSegs(doc, fin!.seg.token_texts, fin!.seg.token_ppls, blk.contentStart, heat);
-        } else {
+        } else if (blk !== active) {
+          // 活动块之外的失配 generate 才整块灰显；活动块由 activePpl 覆盖
           this.tokenSegs(doc, [blk.content], [null], blk.contentStart, heat);
         }
       }
@@ -132,7 +174,6 @@ export class Decorator {
     }
 
     // 活动生成单元：activePpl 覆盖其内容
-    const active = parsed.active;
     if (active) {
       generates.push(
         new vscode.Range(
@@ -154,6 +195,8 @@ export class Decorator {
     for (const [type, ranges] of heat) editor.setDecorations(type, ranges);
     editor.setDecorations(this.grayType, []);
     editor.setDecorations(this.promptBg, prompts);
+    editor.setDecorations(this.systemBg, systems);
+    editor.setDecorations(this.cotBg, cots);
     editor.setDecorations(this.generateBg, generates);
     editor.setDecorations(this.lockedBg, locked);
   }
@@ -163,6 +206,8 @@ export class Decorator {
     this.heatTypes.clear();
     this.grayType.dispose();
     this.promptBg.dispose();
+    this.systemBg.dispose();
+    this.cotBg.dispose();
     this.generateBg.dispose();
     this.lockedBg.dispose();
   }

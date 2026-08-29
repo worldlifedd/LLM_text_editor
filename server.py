@@ -17,6 +17,8 @@ core.py（文档序列化、上下文组装、困惑度聚合），默认监听 
 """
 import argparse
 import json
+import os
+import sys
 import threading
 
 from fastapi import FastAPI
@@ -66,6 +68,9 @@ class GenParams(BaseModel):
     top_k: int = 50
     top_p: float = 0.95
     repetition_penalty: float = 1.1
+    # 思考模式（推理模型）：None=模型默认；False=关闭（Qwen3 模板 /
+    # vLLM chat_template_kwargs）；True 显式开启
+    enable_thinking: bool | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -85,6 +90,11 @@ def status():
         "loading": _LOADING["running"],
         "message": _LOADING["message"] or ("已加载" if b.loaded else "未加载"),
         "generating": _GEN_LOCK.locked(),
+        # 思维链能力：supported=yes/no/unknown、toggleable=可开关
+        "reasoning": b.reasoning_support(),
+        # 供前端（VSCode 插件）校验服务进程的解释器是否与配置一致
+        "python": sys.executable,
+        "pid": os.getpid(),
     }
 
 
@@ -161,7 +171,7 @@ def generate(req: GenerateRequest):
     # 无活动生成单元（最后一个块不是 generate）时，按最后一块生成块为活动块
     if not blocks or blocks[-1].get("type") != "generate":
         return JSONResponse(
-            {"error": "文档缺少活动生成单元：请先创建 <generate> 块"}, status_code=400
+            {"error": "文档缺少活动生成单元：请先创建生成块（<!-- generate -->）"}, status_code=400
         )
     blocks, active = blocks[:-1], blocks[-1].get("content", "")
 
@@ -169,7 +179,8 @@ def generate(req: GenerateRequest):
         skills = scan_skills()
         enabled = [s for s in skills if s.name in (req.skills or [])]
         skill_ctx = skills_to_context(enabled)
-        prompt = build_prompt(blocks, active, skill_ctx, mode=mode, backend=backend)
+        prompt = build_prompt(blocks, active, skill_ctx, mode=mode, backend=backend,
+                              enable_thinking=req.params.enable_thinking)
         if not prompt or (isinstance(prompt, str) and not prompt.strip()):
             return JSONResponse({"error": "文档为空：请先添加提示词块并输入内容"}, status_code=400)
     except Exception as e:  # noqa: BLE001
@@ -186,6 +197,7 @@ def generate(req: GenerateRequest):
         top_k=int(p.top_k),
         top_p=float(p.top_p),
         repetition_penalty=float(p.repetition_penalty),
+        enable_thinking=p.enable_thinking,  # API 后端落为 chat_template_kwargs
     )
 
     def _stream():
@@ -204,8 +216,12 @@ def generate(req: GenerateRequest):
                 cache_note = getattr(backend, "last_cache_info", "")
                 yield _sse_event("update", {
                     "cum_text": upd.cum_text,
+                    "reasoning_cum": upd.reasoning_cum,  # 思维链（推理模型）
                     "token_texts": upd.token_texts,
                     "token_ppls": upd.token_ppls,
+                    # 思维链困惑度（本地/llama.cpp；API 无 reasoning logprobs）
+                    "reasoning_token_texts": upd.reasoning_token_texts,
+                    "reasoning_token_ppls": upd.reasoning_token_ppls,
                     "final": upd.final,
                     "cache_info": cache_note if backend.kind in ("local", "llamacpp") else "",
                 })
@@ -228,7 +244,11 @@ def stop():
 
 @app.get("/api/skills")
 def skills():
-    return [{"name": s.name, "description": s.description} for s in scan_skills()]
+    # instructions 一并返回：供前端把技能固化为文档内 system 块（文档自包含）
+    return [
+        {"name": s.name, "description": s.description, "instructions": s.instructions}
+        for s in scan_skills()
+    ]
 
 
 def main():

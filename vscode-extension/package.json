@@ -20,7 +20,7 @@
     "commands": [
       {
         "command": "gte.generate",
-        "title": "GTE: 生成（续写当前生成块）",
+        "title": "GTE: 生成 / 停止（同一按键切换）",
         "category": "GTE"
       },
       {
@@ -36,6 +36,11 @@
       {
         "command": "gte.addPromptBlock",
         "title": "GTE: 追加提示词块",
+        "category": "GTE"
+      },
+      {
+        "command": "gte.insertSkillBlock",
+        "title": "GTE: 固化技能为系统提示词块",
         "category": "GTE"
       },
       {
@@ -71,6 +76,12 @@
         "command": "gte.finalizeBlock",
         "key": "ctrl+shift+enter",
         "mac": "cmd+shift+enter",
+        "when": "editorTextFocus && editorLangId == markdown"
+      },
+      {
+        "command": "gte.addPromptBlock",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p",
         "when": "editorTextFocus && editorLangId == markdown"
       }
     ],

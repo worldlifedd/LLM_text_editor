@@ -8,10 +8,12 @@ export interface GenParams {
   top_k: number;
   top_p: number;
   repetition_penalty: number;
+  /** 思考模式（推理模型）：null=模型默认；false=关闭；true=强制开启 */
+  enable_thinking?: boolean | null;
 }
 
 export interface GenerateRequest {
-  blocks: { type: "prompt" | "generate"; content: string }[];
+  blocks: { type: "prompt" | "system" | "cot" | "generate"; content: string }[];
   active_text: string;
   skills: string[];
   params: GenParams;
@@ -20,8 +22,13 @@ export interface GenerateRequest {
 
 export interface GenUpdate {
   cum_text: string;
+  /** 累计思维链（推理模型；非推理模型为空） */
+  reasoning_cum?: string;
   token_texts: string[];
   token_ppls: (number | null)[];
+  /** 思维链困惑度（本地/llama.cpp 后端；API 无 reasoning logprobs） */
+  reasoning_token_texts?: string[];
+  reasoning_token_ppls?: (number | null)[];
   final: boolean;
   cache_info?: string;
 }
@@ -29,6 +36,8 @@ export interface GenUpdate {
 export interface SkillInfo {
   name: string;
   description: string;
+  /** 完整指令体（供固化为文档内 system 块） */
+  instructions: string;
 }
 
 export interface GenerateHandlers {
@@ -81,7 +90,10 @@ export function apiStop(): Promise<{ stopped: boolean }> {
 }
 
 export function apiSkills(): Promise<SkillInfo[]> {
-  return postJson("/api/skills", {});
+  // 服务端为 GET 端点（POST 会返回 405）
+  return fetch(`${serverUrl()}/api/skills`, { signal: AbortSignal.timeout(3000) }).then(
+    (r) => r.json() as Promise<SkillInfo[]>
+  );
 }
 
 /** POST /api/generate 并解析 SSE 流。signal 可中止（停止）。 */

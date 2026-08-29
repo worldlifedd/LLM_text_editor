@@ -145,6 +145,20 @@ def plot_data(token_ppls, window=10):
 
 
 # ==================================================================== 事件处理器
+def _reasoning_note(backend):
+    """思维链能力描述（加载完成状态展示）。"""
+    rs = backend.reasoning_support()
+    if rs["supported"] == "yes":
+        s = "🧠 支持思维链"
+    elif rs["supported"] == "no":
+        s = "🧠 不支持思维链"
+    else:
+        s = "🧠 思维链待检测（生成时自动确认）"
+    if rs["toggleable"]:
+        s += "，可用「思考模式」开关"
+    return s
+
+
 def on_load_model(mode, model_path, base_url, api_key, api_model,
                   llama_path, llama_gpu, llama_ctx):
     """按模式加载：local=本地模型；llamacpp=GGUF 量化模型；api=OpenAI 兼容 API。"""
@@ -158,6 +172,7 @@ def on_load_model(mode, model_path, base_url, api_key, api_model,
                 model_status: (
                     f"✅ API 已连接：{backend.model} @ {backend.base_url}"
                     "｜logprobs（逐 token 困惑度）将在首次生成时自动探测"
+                    f"｜{_reasoning_note(backend)}"
                 )
             }
         except Exception as e:  # noqa: BLE001
@@ -178,6 +193,7 @@ def on_load_model(mode, model_path, base_url, api_key, api_model,
                     + (f"｜{backend.quant_info}" if backend.quant_info else "")
                     + f"｜设备：{backend.device}｜上下文：{backend.context_size}"
                     "｜逐 token / 上下文困惑度均可用"
+                    f"｜{_reasoning_note(backend)}"
                 )
             }
         except Exception as e:  # noqa: BLE001
@@ -195,25 +211,30 @@ def on_load_model(mode, model_path, base_url, api_key, api_model,
             model_status: (
                 f"✅ 已加载：{path}｜设备：{backend.device}｜"
                 f"参数量：{sum(p.numel() for p in backend.model.parameters()) / 1e6:.0f}M"
+                f"｜{_reasoning_note(backend)}"
             )
         }
     except Exception as e:  # noqa: BLE001
         yield {model_status: f"❌ 加载失败：{e}"}
 
 
-def on_generate(blocks, active_text, enabled_skill_names, skills_list,
+def on_generate(blocks, active_text, cot_text, enabled_skill_names, skills_list,
                 max_new_tokens, do_sample, temperature, top_k, top_p,
-                repetition_penalty, context_mode):
+                repetition_penalty, context_mode, thinking_mode):
     backend = _backend()
     if not backend.loaded:
         yield {status_tb: "❌ 模型尚未加载/连接，请先在顶栏完成加载"}
         return
 
+    # 思考模式（推理模型）：auto→None（模型默认）、on→True、off→False
+    enable_thinking = {"auto": None, "on": True, "off": False}.get(thinking_mode or "auto")
+
     enabled = [s for s in (skills_list or []) if s.name in (enabled_skill_names or [])]
     skill_ctx = skills_to_context(enabled)
     try:
         prompt = build_prompt(blocks or [], active_text or "", skill_ctx,
-                              mode=context_mode or "chat", backend=backend)
+                              mode=context_mode or "chat", backend=backend,
+                              enable_thinking=enable_thinking)
     except Exception as e:  # 模型无聊天模板等
         yield {status_tb: f"❌ 上下文构造失败（可切换为 prefix/raw 模式）：{e}"}
         return
@@ -222,6 +243,7 @@ def on_generate(blocks, active_text, enabled_skill_names, skills_list,
         return
 
     base = active_text or ""
+    cot_base = cot_text or ""
     # 对账：编辑点之前的着色保留，编辑区域及之后合并为无数据段(None)
     seg_t, seg_p = reconcile_active_ppl(
         _ACTIVE_PPL["token_texts"], _ACTIVE_PPL["token_ppls"], base
@@ -257,6 +279,7 @@ def on_generate(blocks, active_text, enabled_skill_names, skills_list,
             top_k=int(top_k),
             top_p=float(top_p),
             repetition_penalty=float(repetition_penalty),
+            enable_thinking=enable_thinking,
         )
         for upd in backend.generate_stream(prompt, **params):
             full_text = base + upd.cum_text
@@ -267,6 +290,7 @@ def on_generate(blocks, active_text, enabled_skill_names, skills_list,
             cache_note = getattr(backend, "last_cache_info", "")
             yield {
                 active_cell_tb: full_text,
+                cot_cell_tb: cot_base + (upd.reasoning_cum or ""),
                 avg_ppl_num: round(avg_ppl_of(all_ppls) or 0.0, 2) if all_ppls else None,
                 ppl_plot: plot_data(all_ppls),
                 heatmap_md: doc_heatmap_html(blocks, full_text),
@@ -276,6 +300,16 @@ def on_generate(blocks, active_text, enabled_skill_names, skills_list,
                     f"｜本轮 token：{len(upd.token_ppls)}"
                     f"｜累计着色：{len(all_ppls)}｜"
                     f"平均困惑度：{avg_ppl_of(all_ppls) or 0:.2f}"
+                    + (
+                        f"｜🧠 思维链：{len(upd.reasoning_cum or '')} 字"
+                        + (
+                            f"｜思维链困惑度：{avg_ppl_of(upd.reasoning_token_ppls) or 0:.2f}"
+                            if upd.reasoning_token_ppls
+                            else "（API 无数据）"
+                        )
+                        if upd.reasoning_cum
+                        else ""
+                    )
                     + (f"｜{cache_note}" if cache_note and backend.kind in ("local", "llamacpp") else "")
                 ),
             }
@@ -297,9 +331,13 @@ def on_add_prompt(blocks):
     }
 
 
-def on_add_generate(blocks, active_text):
+def on_add_generate(blocks, active_text, cot_text):
     blocks = list(blocks or [])
     c = (active_text or "").strip()
+    # 本轮思维链随块定稿：落为 cot 块（<!-- cot ... -->，渲染不可见）
+    cot_c = (cot_text or "").strip()
+    if cot_c:
+        blocks.append({"type": "cot", "content": cot_c})
     blk = {"type": "generate", "content": c}
     if _ACTIVE_PPL["token_texts"]:
         # 着色数据随块冻结保留；块内容为 strip 后文本，需先对齐首尾空白
@@ -324,6 +362,7 @@ def on_add_generate(blocks, active_text):
     return {
         blocks_state: blocks,
         active_cell_tb: "",
+        cot_cell_tb: "",
         avg_ppl_num: round(avg_ppl_of(all_ppls) or 0.0, 2) if all_ppls else None,
         ppl_plot: plot_data(all_ppls),
         heatmap_md: doc_heatmap_html(blocks, ""),
@@ -395,6 +434,7 @@ def on_load_doc(file):
         return {
             blocks_state: blocks,
             active_cell_tb: active,
+            cot_cell_tb: "",
             avg_ppl_num: None,
             ppl_plot: empty_plot_df(),
             heatmap_md: doc_heatmap_html(blocks, active),
@@ -442,6 +482,24 @@ def on_upload_skill(file):
         }
     except Exception as e:  # noqa: BLE001
         return {status_tb: f"❌ 导入失败：{e}"}
+
+
+def on_embed_skills(blocks, enabled_skill_names, skills_list):
+    """把勾选技能固化为文档顶部的 system 块：文档自包含，
+    换到没有该技能的环境也能复现生成过程。"""
+    enabled = [s for s in (skills_list or []) if s.name in (enabled_skill_names or [])]
+    if not enabled:
+        return {status_tb: "❌ 请先勾选要固化的技能"}
+    sys_blocks = [{"type": "system", "content": skills_to_context([s])} for s in enabled]
+    blocks = sys_blocks + [dict(b) for b in (blocks or [])]
+    return {
+        blocks_state: blocks,
+        skills_check: gr.update(value=[]),  # 已固化，避免重复拼入
+        status_tb: (
+            f"📥 已将 {len(enabled)} 个技能固化为系统提示词块"
+            "（写入文档顶部，保存后自包含，可在无该技能的环境复现生成）"
+        ),
+    }
 
 
 # ==================================================================== UI
@@ -524,6 +582,17 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
                     value="chat",
                     label="上下文模式（提示词块如何呈现给模型）",
                 )
+                thinking_mode_rd = gr.Radio(
+                    choices=[
+                        ("auto（模型默认）", "auto"),
+                        ("on（强制思考）", "on"),
+                        ("off（关闭思考·提速）", "off"),
+                    ],
+                    value="auto",
+                    label="🧠 思考模式（推理模型：DeepSeek-R1/Qwen3/GLM 等；"
+                          "本地=聊天模板 enable_thinking，API=chat_template_kwargs，"
+                          "llama.cpp 由 GGUF 模板决定）",
+                )
                 max_new_tokens_sl = gr.Slider(16, 2048, value=256, step=16,
                                               label="max_new_tokens（最大生成 token 数）")
                 do_sample_cb = gr.Checkbox(value=True, label="do_sample（采样；关闭则贪心解码）")
@@ -562,6 +631,9 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
                 skills_info = gr.HTML(_skills_info_html(_initial_skills))
                 with gr.Row():
                     refresh_skills_btn = gr.Button("🔄 刷新技能库", size="sm")
+                    embed_skills_btn = gr.Button(
+                        "📥 固化选中技能为系统块", size="sm"
+                    )
                 upload_skill_file = gr.File(
                     label="上传 skill（.md）", file_types=[".md"], height=80
                 )
@@ -580,14 +652,22 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
             @gr.render(inputs=[blocks_state])
             def render_blocks(blocks):
                 for i, blk in enumerate(blocks or []):
-                    is_prompt = blk["type"] == "prompt"
-                    base_label = ("📝 提示词块" if is_prompt else "⚙️ 生成块") + f" #{i + 1}"
+                    t = blk["type"]
+                    if t == "prompt":
+                        base_label = f"📝 提示词块 #{i + 1}"
+                    elif t == "system":
+                        base_label = f"🛠 系统提示词块 #{i + 1}（自包含技能，随文档保存）"
+                    elif t == "cot":
+                        base_label = f"🧠 思维链块 #{i + 1}（默认隐藏，可编辑）"
+                    else:
+                        base_label = f"⚙️ 生成块 #{i + 1}"
                     locked = bool(blk.get("locked"))
                     with gr.Group():
-                        # 锁定块折叠为可展开标题栏（点击展开查看/解锁）
+                        # 锁定块折叠为可展开标题栏（点击展开查看/解锁）；
+                        # 思维链块默认折叠（对应 Markdown 渲染中的隐藏）
                         with gr.Accordion(
                             (f"🔒 {base_label} · 已锁定（点击展开）" if locked else base_label),
-                            open=not locked,
+                            open=not locked and t != "cot",
                         ):
                             with gr.Row():
                                 tb = gr.Textbox(
@@ -624,6 +704,16 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
                             tb.blur(_update, inputs=[blocks_state, tb], outputs=[blocks_state])
                             lock_btn.click(_toggle, inputs=[blocks_state], outputs=[blocks_state])
                             del_btn.click(_delete, inputs=[blocks_state], outputs=[blocks_state])
+
+            # 当前轮思维链：推理模型（DeepSeek-R1/GLM/Qwen3 等）流式显示于此，
+            # 定稿时随块保存为 cot 注释块（Markdown 渲染中不可见）
+            with gr.Accordion("🧠 思维链（当前轮·推理模型流式显示，定稿时随块保存）", open=False):
+                cot_cell_tb = gr.Textbox(
+                    label="思维链（当前轮）— 可手动编辑",
+                    lines=5,
+                    placeholder="推理模型生成时，思考过程在此流式显示（正文在下方生成块）；非推理模型此处为空",
+                    interactive=True,
+                )
 
             active_cell_tb = gr.Textbox(
                 label="⚙️ 生成块（当前·最后一块）— LLM 流式输出于此，暂停后可手动编辑，再次生成将续写",
@@ -684,28 +774,32 @@ with gr.Blocks(title="生成式文本编辑器") as demo:
     generate_btn.click(
         on_generate,
         inputs=[
-            blocks_state, active_cell_tb, skills_check, skills_state,
+            blocks_state, active_cell_tb, cot_cell_tb, skills_check, skills_state,
             max_new_tokens_sl, do_sample_cb, temperature_sl, top_k_sl,
-            top_p_sl, rep_pen_sl, context_mode_rd,
+            top_p_sl, rep_pen_sl, context_mode_rd, thinking_mode_rd,
         ],
         outputs=[
-            active_cell_tb, avg_ppl_num, ppl_plot, heatmap_md,
+            active_cell_tb, cot_cell_tb, avg_ppl_num, ppl_plot, heatmap_md,
             ctx_ppl_num, status_tb,
         ],
     )
     stop_btn.click(on_stop, inputs=None, outputs=[status_tb])
     add_prompt_btn.click(on_add_prompt, inputs=[blocks_state],
                          outputs=[blocks_state, status_tb])
-    add_generate_btn.click(on_add_generate, inputs=[blocks_state, active_cell_tb],
-                           outputs=[blocks_state, active_cell_tb,
+    add_generate_btn.click(on_add_generate,
+                           inputs=[blocks_state, active_cell_tb, cot_cell_tb],
+                           outputs=[blocks_state, active_cell_tb, cot_cell_tb,
                                     avg_ppl_num, ppl_plot, heatmap_md, status_tb])
     save_btn.click(on_save, inputs=[blocks_state, active_cell_tb],
                    outputs=[download_file, status_tb])
     upload_doc_file.change(on_load_doc, inputs=[upload_doc_file],
-                           outputs=[blocks_state, active_cell_tb,
+                           outputs=[blocks_state, active_cell_tb, cot_cell_tb,
                                     avg_ppl_num, ppl_plot, heatmap_md, status_tb])
     refresh_skills_btn.click(on_refresh_skills, inputs=None,
                              outputs=[skills_state, skills_check, skills_info, status_tb])
+    embed_skills_btn.click(on_embed_skills,
+                           inputs=[blocks_state, skills_check, skills_state],
+                           outputs=[blocks_state, skills_check, status_tb])
     upload_skill_file.change(on_upload_skill, inputs=[upload_skill_file],
                              outputs=[skills_state, skills_check, skills_info, status_tb])
 

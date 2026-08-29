@@ -66,24 +66,67 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   });
 
-  async function pollStatus(): Promise<void> {
-    try {
-      const st = await getStatus();
-      const label = st.loading
-        ? `$(sync~spin) GTE: 加载中…`
-        : st.loaded
-        ? `$(check) GTE: ${
-            st.kind === "local" ? "本地" : st.kind === "llamacpp" ? "llama.cpp" : "API"
-          }${st.generating ? "｜生成中…" : ""}`
-        : "GTE: 未连接";
-      statusBar.text = label;
+  // 把服务端状态反映到状态栏 + 面板。pollStatus 与 watchLoadResult 共用。
+  function applyStatus(st: Awaited<ReturnType<typeof getStatus>>): void {
+    // 生成进行中：保持醒目的工作状态提示（含停止入口），不被轮询覆盖
+    if (gen.isGenerating) {
+      statusBar.text = "$(sync~spin) GTE: 生成中…（再按 Ctrl+Enter 停止）";
       statusBar.tooltip = st.message;
       panel?.post({ type: "status", status: st });
+      return;
+    }
+    const label = st.loading
+      ? `$(sync~spin) GTE: 加载中…`
+      : st.loaded
+      ? `$(check) GTE: ${
+          st.kind === "local" ? "本地" : st.kind === "llamacpp" ? "llama.cpp" : "API"
+        }${st.generating ? "｜生成中…" : ""}`
+      : "GTE: 未连接";
+    statusBar.text = label;
+    statusBar.tooltip = st.message;
+    panel?.post({ type: "status", status: st });
+  }
+
+  async function pollStatus(): Promise<void> {
+    try {
+      applyStatus(await getStatus());
     } catch {
       statusBar.text = "GTE: 未连接";
     }
   }
   const timer = setInterval(() => void pollStatus(), 10000);
+
+  // /api/load 是异步后台任务：立即返回 {accepted:true}，真正成败写进
+  // status.message。仅靠 10s 轮询且不弹窗，加载失败时用户只看到状态栏默默变
+  // "未连接"。此 watcher 在提交加载后快速轮询，loading 结束即主动弹成功/失败
+  // 通知，并把加载期间状态实时推给状态栏与面板（不必等下一个 10s 周期）。
+  let loadWatchAbort: AbortController | null = null;
+  async function watchLoadResult(): Promise<void> {
+    loadWatchAbort?.abort(); // 新一次加载提交，中止旧 watcher
+    const ac = new AbortController();
+    loadWatchAbort = ac;
+    const deadline = Date.now() + 180000; // 大模型加载最长观察 3 分钟
+    let sawLoading = false;
+    while (!ac.signal.aborted && Date.now() < deadline) {
+      const st = await getStatus().catch(async () => {
+        await new Promise((r) => setTimeout(r, 1000));
+        return null;
+      });
+      if (!st) continue;
+      applyStatus(st);
+      if (st.loading) sawLoading = true;
+      if (sawLoading && !st.loading) {
+        // loading 由 true→false：加载结束（成功或失败）
+        if (st.loaded) {
+          vscode.window.showInformationMessage(st.message || "✅ 模型加载成功");
+        } else {
+          vscode.window.showErrorMessage(st.message || "❌ 加载失败（未知原因）");
+        }
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+  }
 
   // 侧边面板
   const provider = new GtePanelProvider(
@@ -114,17 +157,19 @@ export function activate(context: vscode.ExtensionContext): void {
             n_gpu_layers: typeof m.n_gpu_layers === "number" ? m.n_gpu_layers : undefined,
             n_ctx: typeof m.n_ctx === "number" ? m.n_ctx : undefined,
           });
-          vscode.window.showInformationMessage("已提交加载请求，请稍候…（看下方状态）");
+          vscode.window.showInformationMessage("已提交加载请求，正在后台加载…");
+          void watchLoadResult(); // loading 结束后主动弹成功/失败通知
         } catch (e) {
           vscode.window.showErrorMessage(`加载失败：${(e as Error).message}`);
         }
-        void pollStatus();
       } else if (t === "generate") {
         const params = m.params as GenParams;
         const context_mode = (m.context_mode as string) || "chat";
         const skills = (m.skills as string[]) || [];
         await context.workspaceState.update("gte.params", { params, context_mode, skills });
-        void gen.start();
+        // 生成/停止同一按键切换
+        if (gen.isGenerating) void gen.stop();
+        else void gen.start();
       } else if (t === "stop") {
         void gen.stop();
       } else if (t === "refreshSkills") {
@@ -141,10 +186,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // 命令
   context.subscriptions.push(
-    vscode.commands.registerCommand("gte.generate", () => void gen.start()),
+    // 生成/停止同一按键切换：用户随时知道 LLM 是否在工作
+    vscode.commands.registerCommand("gte.generate", () =>
+      gen.isGenerating ? void gen.stop() : void gen.start()
+    ),
     vscode.commands.registerCommand("gte.stop", () => void gen.stop()),
     vscode.commands.registerCommand("gte.finalizeBlock", () => void gen.finalize()),
     vscode.commands.registerCommand("gte.addPromptBlock", () => void gen.addPrompt()),
+    vscode.commands.registerCommand("gte.insertSkillBlock", () => void gen.insertSkillBlock()),
     vscode.commands.registerCommand("gte.toggleLock", () => gen.toggleLock()),
     vscode.commands.registerCommand("gte.newDocument", async () => {
       const doc = await vscode.workspace.openTextDocument({

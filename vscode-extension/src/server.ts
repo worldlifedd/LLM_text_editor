@@ -10,6 +10,11 @@ export interface ServerStatus {
   loading: boolean;
   message: string;
   generating: boolean;
+  /** 服务进程解释器与 PID（server.py 上报，旧版服务可能缺省） */
+  python?: string;
+  pid?: number;
+  /** 思维链能力：supported=yes/no/unknown；toggleable=可开关 */
+  reasoning?: { supported?: string; toggleable?: boolean };
 }
 
 let child: ChildProcess | null = null;
@@ -71,17 +76,73 @@ async function waitUntilReady(timeoutMs = 60000): Promise<boolean> {
   return false;
 }
 
+/** 探活并取回 status；不可达/非 200 时返回 null。 */
+async function fetchStatus(url: string): Promise<ServerStatus | null> {
+  try {
+    const r = await fetch(`${url}/api/status`, { signal: AbortSignal.timeout(2000) });
+    if (!r.ok) return null;
+    return (await r.json().catch(() => null)) as ServerStatus | null;
+  } catch {
+    return null;
+  }
+}
+
+/** 路径归一化（分隔符/大小写/尾斜杠），用于跨平台比较 python 路径。 */
+function normPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function isAbsPath(p: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(p) || /^[\\/]/.test(p);
+}
+
+/** 等端口释放（旧进程退出需一小段时间）。 */
+async function waitPortFree(url: string, timeoutMs = 5000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await fetchStatus(url))) return true;
+    await new Promise((res) => setTimeout(res, 300));
+  }
+  return false;
+}
+
 /** 确保服务可达；不可达且允许时自动拉起。返回服务地址。 */
 export async function ensureServer(): Promise<string> {
   const url = serverUrl();
-  try {
-    const r = await fetch(`${url}/api/status`, { signal: AbortSignal.timeout(2000) });
-    if (r.ok) return url;
-  } catch {
-    /* fall through to spawn */
+  const cfg = vscode.workspace.getConfiguration("gte");
+  const py = cfg.get<string>("pythonCommand") || "python";
+  log(`ensureServer: gte.pythonCommand = "${py}"`);
+  log(`ensureServer: 探活 ${url}/api/status ...`);
+  const st = await fetchStatus(url);
+  if (st) {
+    // 已有服务在跑。校验其解释器是否与 gte.pythonCommand 一致：不一致
+    // 说明是改配置前残留的旧进程（常见于换 conda 环境后），继续复用会在
+    // 加载模型时报“llama-cpp-python 未安装”等环境错误 → 自动结束重启。
+    if (st.python && st.pid && isAbsPath(py) && normPath(st.python) !== normPath(py)) {
+      log(
+        `ensureServer: 端口服务由 ${st.python}（pid=${st.pid}）运行，` +
+          `与配置 gte.pythonCommand=${py} 不一致，自动重启为配置解释器`
+      );
+      try {
+        process.kill(st.pid);
+      } catch (e) {
+        const msg =
+          `端口服务由 ${st.python}（pid=${st.pid}）运行，与 gte.pythonCommand` +
+          `（${py}）不一致且无法自动结束（${(e as Error).message}），请手动结束后重试`;
+        log(`ensureServer: ${msg}`);
+        throw new Error(msg);
+      }
+      if (!(await waitPortFree(url))) {
+        throw new Error(`旧服务（pid=${st.pid}）结束超时，请稍后重试`);
+      }
+    } else {
+      log(`ensureServer: 服务已可达（python: ${st.python || "未知"}）`);
+      return url;
+    }
+  } else {
+    log(`ensureServer: 探活失败，将尝试拉起`);
   }
 
-  const cfg = vscode.workspace.getConfiguration("gte");
   if (!cfg.get<boolean>("autoStartServer")) {
     throw new Error(
       `服务不可达（${url}），且 gte.autoStartServer 已关闭。请先运行：python server.py`
@@ -93,16 +154,16 @@ export async function ensureServer(): Promise<string> {
 
   const script = findServerScript();
   if (!script) {
-    throw new Error(
-      `未找到 server.py：请在设置 gte.serverScript 中指定，或把 server.py 放入工作区/扩展目录`
-    );
+    const msg = `未找到 server.py：请在设置 gte.serverScript 中指定，或把 server.py 放入工作区/扩展目录`;
+    log(`ensureServer: ${msg}`);
+    throw new Error(msg);
   }
-  const py = cfg.get<string>("pythonCommand") || "python";
-  log(`启动服务：${py} ${script} --port ${serverPort()}`);
+  log(`ensureServer: 启动服务 ${py} ${script} --port ${serverPort()}`);
   child = spawn(py, [script, "--port", String(serverPort())], {
     cwd: path.dirname(script),
     env: { ...process.env, PYTHONUNBUFFERED: "1" },
   });
+  child.once("error", (e) => log(`server.py 启动失败：${e.message}（检查 gte.pythonCommand）`));
   child.stdout?.on("data", (d) => log(d.toString().replace(/\n$/, "")));
   child.stderr?.on("data", (d) => log(d.toString().replace(/\n$/, "")));
   child.on("exit", (code) => {
@@ -110,7 +171,10 @@ export async function ensureServer(): Promise<string> {
     child = null;
   });
 
-  if (await waitUntilReady()) return url;
+  if (await waitUntilReady()) {
+    log(`ensureServer: 服务就绪`);
+    return url;
+  }
   throw new Error(`服务启动超时（${url}）。查看「GTE Server」输出面板了解详情`);
 }
 

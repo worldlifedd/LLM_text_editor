@@ -1,7 +1,7 @@
 // 生成控制器：SSE → 流式插入、ppl 对账、定稿/锁定/追加块、状态栏与面板刷新。
 import * as vscode from "vscode";
-import { apiGenerate, apiStop, GenParams, GenUpdate, GenerateRequest } from "./api";
-import { newDocumentText, parseDoc } from "./docmodel";
+import { apiGenerate, apiSkills, apiStop, GenParams, GenUpdate, GenerateRequest } from "./api";
+import { newDocumentText, parseDoc, skillSystemContent } from "./docmodel";
 import { Decorator, foldingRanges } from "./decorations";
 import { DocState, emptyPpl, PplSeg, reconcileActivePpl, StateStore } from "./state";
 
@@ -29,6 +29,13 @@ export class GenerationController {
   private ctrl: AbortController | null = null;
   private generating = false;
   private selfEdit = false;
+  /** 待落地的本轮累计 ppl 段（基线 + 本轮 token）：文本插入落地 /
+   * 流结束时与文档内容对账写入 activePpl，避免 SSE 快于编辑落地时
+   * 误丢弃本轮 token（着色只到第一句的根因）。 */
+  private pendingSeg: PplSeg | null = null;
+  /** 同上，思维链段（cot 块困惑度着色）。 */
+  private pendingCotSeg: PplSeg | null = null;
+  private lastCacheInfo = "";
 
   constructor(
     private state: StateStore,
@@ -89,16 +96,18 @@ export class GenerationController {
       return;
     }
     if (this.generating) {
-      vscode.window.showWarningMessage("已有生成任务进行中，请先停止");
+      vscode.window.showWarningMessage("已有生成任务进行中，请先停止（再按一次 Ctrl+Enter 即停止）");
       return;
     }
     const { editor, doc, state } = s;
     this.ctxPpl = null;
+    // 等待上一轮的增量插入全部落地，再基于最新文档做对账
+    await this.editQueue;
 
     // 确保存在活动生成单元（最后一块为 generate）
     let parsed = parseDoc(doc.getText());
     if (!parsed.active) {
-      await editor.edit((e) => e.insert(new vscode.Position(doc.lineCount, 0), "\n\n<generate>\n\n</generate>"));
+      await editor.edit((e) => e.insert(new vscode.Position(doc.lineCount, 0), "\n\n<!-- generate -->\n"));
       parsed = parseDoc(doc.getText());
       if (!parsed.active) {
         vscode.window.showErrorMessage("无法创建生成块");
@@ -114,14 +123,33 @@ export class GenerationController {
       activeText
     );
     state.activePpl = seg;
+    this.pendingSeg = null;
+    // 思维链基线：活动 cot 块（blocks 倒数第二块、紧邻活动生成块）已有内容对账
+    const cotBlk = parsed.blocks[parsed.blocks.length - 2];
+    const cotSeg =
+      cotBlk && cotBlk.type === "cot"
+        ? reconcileActivePpl(
+            state.activeCotPpl.token_texts,
+            state.activeCotPpl.token_ppls,
+            cotBlk.content
+          )
+        : emptyPpl();
+    state.activeCotPpl = cotSeg;
+    this.pendingCotSeg = null;
+    // 本轮基线段（覆盖 activeText 已有着色）。服务端 token_texts 为全量
+    // 累计（join(token_texts) == cum_text），合并 = 基线 + 本轮累计，
+    // 不能与不断膨胀的 activePpl 自身拼接（会重复累计）。
+    const baseline: PplSeg = {
+      token_texts: [...seg.token_texts],
+      token_ppls: [...seg.token_ppls],
+    };
 
     const { params, context_mode, skills } = this.cb.getRequestState();
     const req: GenerateRequest = {
-      // 服务端契约：blocks 尾部须为活动 <generate> 块（active 由服务端从最后一块推导）
-      blocks: [
-        ...parsed.blocks.map((b) => ({ type: b.type, content: b.content })),
-        { type: "generate" as const, content: activeText },
-      ],
+      // 服务端契约：blocks 尾部的 generate 块即活动生成单元（parseDoc 的
+      // blocks 本就以活动块结尾，直接映射即可；额外追加 active 副本会把
+      // 活动内容在上下文中重复两遍）
+      blocks: parsed.blocks.map((b) => ({ type: b.type, content: b.content })),
       active_text: activeText,
       skills,
       params,
@@ -131,23 +159,56 @@ export class GenerationController {
     const ctrl = new AbortController();
     this.ctrl = ctrl;
     this.generating = true;
-    this.cb.statusBar("⏳ 生成中…（Ctrl+Alt+Enter 停止）");
+    this.cb.statusBar("⏳ 生成中…（再按 Ctrl+Enter 停止）");
+    this.cb.notifyPanel({ type: "gen", generating: true });
     let lastCum = 0;
+    let lastReasoning = 0;
 
     const onUpdate = (u: GenUpdate) => {
       const delta = u.cum_text.slice(lastCum);
       lastCum = u.cum_text.length;
+      const rCum = u.reasoning_cum || "";
+      const rDelta = rCum.slice(lastReasoning);
+      lastReasoning = rCum.length;
+      if (u.cache_info) this.lastCacheInfo = u.cache_info;
+      if (rDelta) this.insertReasoningDelta(rDelta);
       if (delta) this.insertDelta(delta);
-      // 累计着色：基线段 + 本轮新 token，随后按当前内容对账
+      // 累计着色：基线段 + 本轮全量累计 token。仅当文档内容已覆盖该段
+      //（编辑队列落地）才立即对账；否则推迟到 insertDelta 落地后/流结束
+      // 时补齐——若此刻对账，会把尚未落地的本轮 token 全部误判为丢失。
+      const merged: PplSeg = {
+        token_texts: [...baseline.token_texts, ...u.token_texts],
+        token_ppls: [...baseline.token_ppls, ...u.token_ppls],
+      };
+      this.pendingSeg = merged;
+      // 思维链段：cot 基线 + 本轮思考 token（API 无 reasoning logprobs
+      // 时为空数组，思维链不着色）
+      const rMerged: PplSeg = {
+        token_texts: [...cotSeg.token_texts, ...(u.reasoning_token_texts || [])],
+        token_ppls: [...cotSeg.token_ppls, ...(u.reasoning_token_ppls || [])],
+      };
+      this.pendingCotSeg = rMerged;
       const ds = this.session();
       if (ds) {
-        const merged: PplSeg = {
-          token_texts: [...ds.state.activePpl.token_texts, ...u.token_texts],
-          token_ppls: [...ds.state.activePpl.token_ppls, ...u.token_ppls],
-        };
-        const act = parseDoc(ds.doc.getText()).active;
+        const parsedDs = parseDoc(ds.doc.getText());
+        const act = parsedDs.active;
         const cur = act ? act.content : "";
-        ds.state.activePpl = reconcileActivePpl(merged.token_texts, merged.token_ppls, cur);
+        if (cur.startsWith(merged.token_texts.join(""))) {
+          ds.state.activePpl = reconcileActivePpl(merged.token_texts, merged.token_ppls, cur);
+        }
+        // cot 同步对账（内容已落地时；blocks 末位是活动块，cot 在倒数第二）
+        const cotNow = parsedDs.blocks[parsedDs.blocks.length - 2];
+        if (
+          cotNow &&
+          cotNow.type === "cot" &&
+          cotNow.content.startsWith(rMerged.token_texts.join(""))
+        ) {
+          ds.state.activeCotPpl = reconcileActivePpl(
+            rMerged.token_texts,
+            rMerged.token_ppls,
+            cotNow.content
+          );
+        }
       }
       const parsedNow = parseDoc(this.docText());
       if (parsedNow.active) this.emitPpl(parsedNow, this.state.get(this.currentUri()), u.cache_info || "");
@@ -179,14 +240,28 @@ export class GenerationController {
     } finally {
       if (this.ctrl === ctrl) this.ctrl = null;
       this.generating = false;
-      if (!ctrl.signal.aborted) this.cb.statusBar("⏹ 已停止，生成结果已保留");
+      // 正常完成时保留 finish 的文案（✅/❌）；仅手动停止才提示已停止
+      if (ctrl.signal.aborted) this.cb.statusBar("⏹ 已停止，生成结果已保留");
       this.cb.notifyPanel({ type: "gen", generating: false });
-      this.cb.refreshDecorations();
+      // 流结束：等编辑队列全部落地后做最终对账，保证尾部着色完整
+      const pending = this.pendingSeg;
+      this.editQueue = this.editQueue.then(() => {
+        if (this.pendingSeg !== pending) return; // 已开启新一轮，交由新轮处理
+        this.applyPendingSeg();
+        this.applyPendingCotSeg();
+        this.pendingSeg = null;
+        this.pendingCotSeg = null;
+        this.cb.refreshDecorations();
+        const parsedNow = parseDoc(this.docText());
+        if (parsedNow.active) this.emitPpl(parsedNow, this.state.get(this.currentUri()), this.lastCacheInfo);
+      });
     }
   }
 
   private finish(msg: string, isError = false): void {
     this.cb.statusBar(msg, isError ? "GTE 生成错误" : undefined);
+    // 错误必须弹窗：状态栏文案会被 10s 轮询覆盖，用户只看到"没反应"
+    if (isError) vscode.window.showErrorMessage(msg);
     this.cb.notifyPanel({ type: "gen", generating: false });
   }
 
@@ -197,20 +272,108 @@ export class GenerationController {
     return vscode.window.activeTextEditor?.document.uri.toString() ?? "";
   }
 
-  /** 在活动生成块内容末尾插入增量文本。 */
+  /** 串行编辑队列：SSE 事件可能快于上一次 edit 应用，直接并发计算
+   * 插入点会用陈旧 offset 导致错位/乱序，故排队依次执行。 */
+  private editQueue: Promise<void> = Promise.resolve();
+
+  /** 将 pendingSeg 与当前文档内容对账后落地（在文本插入落地后调用）。 */
+  private applyPendingSeg(): void {
+    if (!this.pendingSeg) return;
+    const s = this.session();
+    if (!s) return;
+    const act = parseDoc(s.doc.getText()).active;
+    const cur = act ? act.content : "";
+    s.state.activePpl = reconcileActivePpl(
+      this.pendingSeg.token_texts,
+      this.pendingSeg.token_ppls,
+      cur
+    );
+  }
+
+  /** 同上，思维链段：写入活动 cot 块的 ppl。 */
+  private applyPendingCotSeg(): void {
+    if (!this.pendingCotSeg) return;
+    const s = this.session();
+    if (!s) return;
+    const parsed = parseDoc(s.doc.getText());
+    if (!parsed.active) return;
+    // blocks 末位是活动生成块，紧邻其前的 cot 即活动思维链块
+    const cot = parsed.blocks[parsed.blocks.length - 2];
+    if (!cot || cot.type !== "cot") return;
+    s.state.activeCotPpl = reconcileActivePpl(
+      this.pendingCotSeg.token_texts,
+      this.pendingCotSeg.token_ppls,
+      cot.content
+    );
+  }
+
+  /** 在活动生成块内容末尾插入增量文本（经队列串行）。 */
   private insertDelta(delta: string): void {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return;
-    const parsed = parseDoc(editor.document.getText());
-    const act = parsed.active;
-    if (!act) return;
-    const pos = editor.document.positionAt(act.contentEnd);
-    this.selfEdit = true;
-    void editor
-      .edit((e) => e.insert(pos, delta), { undoStopBefore: false, undoStopAfter: false })
-      .then(() => {
+    this.editQueue = this.editQueue.then(() => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.document.languageId !== "markdown") return;
+      const parsed = parseDoc(editor.document.getText());
+      const act = parsed.active;
+      if (!act) return;
+      const pos = editor.document.positionAt(act.contentEnd);
+      this.selfEdit = true;
+      return editor
+        .edit((e) => e.insert(pos, delta), { undoStopBefore: false, undoStopAfter: false })
+        .then(
+          () => {
+            this.selfEdit = false;
+            // 文本落地后立即补齐着色（SSE 与编辑落地的时差不再丢颜色）
+            this.applyPendingSeg();
+            this.cb.refreshDecorations();
+          },
+          () => {
+            this.selfEdit = false;
+          }
+        );
+    });
+  }
+
+  /** 把思维链增量插入活动生成块前紧邻的 cot 注释块（经队列串行）。
+   * 无 cot 块时先在生成块标记前创建 <!-- cot --> 块：思维链随文档保存、
+   * Markdown 渲染不可见，用户可在源码中查看/编辑。 */
+  private insertReasoningDelta(delta: string): void {
+    this.editQueue = this.editQueue.then(async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.document.languageId !== "markdown") return;
+      let parsed = parseDoc(editor.document.getText());
+      const act = parsed.active;
+      if (!act) return;
+      // 活动块是 blocks 的最后一块，其前一块即 cot 候选
+      let cot = parsed.blocks[parsed.blocks.length - 2];
+      if (!cot || cot.type !== "cot") {
+        this.selfEdit = true;
+        try {
+          const pos = editor.document.positionAt(act.blockStart);
+          await editor.edit(
+            (e) => e.insert(pos, "<!-- cot\n-->\n\n"),
+            { undoStopBefore: false, undoStopAfter: false }
+          );
+        } finally {
+          this.selfEdit = false;
+        }
+        parsed = parseDoc(editor.document.getText());
+        cot = parsed.blocks[parsed.blocks.length - 2];
+        if (!cot || cot.type !== "cot") return;
+      }
+      this.selfEdit = true;
+      try {
+        const pos = editor.document.positionAt(cot.contentEnd);
+        await editor.edit(
+          (e) => e.insert(pos, delta),
+          { undoStopBefore: false, undoStopAfter: false }
+        );
+      } finally {
         this.selfEdit = false;
-      });
+      }
+      // 思维链文本落地后立即补齐着色（与正文 insertDelta 同思路）
+      this.applyPendingCotSeg();
+      this.cb.refreshDecorations();
+    });
   }
 
   async stop(): Promise<void> {
@@ -227,6 +390,8 @@ export class GenerationController {
   async finalize(): Promise<void> {
     const s = this.session();
     if (!s) return;
+    // 等待流式插入全部落地再读取，否则冻结的着色可能缺尾部
+    await this.editQueue;
     const { editor, doc, state } = s;
     const parsed = parseDoc(doc.getText());
     if (!parsed.active) {
@@ -254,11 +419,28 @@ export class GenerationController {
         content: parsed.active.content,
       });
     }
+    // 思维链块冻结：活动 cot（blocks 倒数第二块）同样定稿着色
+    const cotBlk = parsed.blocks[parsed.blocks.length - 2];
+    if (
+      cotBlk &&
+      cotBlk.type === "cot" &&
+      state.activeCotPpl.token_texts.length &&
+      "".concat(...state.activeCotPpl.token_texts) === cotBlk.content
+    ) {
+      state.finalized.set(cotBlk.index, {
+        seg: {
+          token_texts: [...state.activeCotPpl.token_texts],
+          token_ppls: [...state.activeCotPpl.token_ppls],
+        },
+        content: cotBlk.content,
+      });
+    }
     // 锁定前序全部块，聚焦新的活动块
     for (const b of parsed.blocks) state.locked.add(b.index);
     state.activePpl = emptyPpl();
+    state.activeCotPpl = emptyPpl();
 
-    await editor.edit((e) => e.insert(new vscode.Position(doc.lineCount, 0), "\n\n<generate>\n\n</generate>"));
+    await editor.edit((e) => e.insert(new vscode.Position(doc.lineCount, 0), "\n\n<!-- generate -->\n"));
     this.cb.statusBar("已定稿当前生成块并开启新块（前序块已锁定折叠）");
     this.cb.refreshDecorations();
   }
@@ -267,9 +449,41 @@ export class GenerationController {
     const s = this.session();
     if (!s) return;
     await s.editor.edit((e) =>
-      e.insert(new vscode.Position(s.doc.lineCount, 0), "\n\n<prompt>\n\n</prompt>")
+      e.insert(new vscode.Position(s.doc.lineCount, 0), "\n\n<!-- prompt\n-->")
     );
     this.cb.statusBar("已追加提示词块");
+    this.cb.refreshDecorations();
+  }
+
+  /** 选择技能并固化为文档顶部的 system 块：文档自包含，
+   * 换到没有该技能的环境也能复现生成过程。 */
+  async insertSkillBlock(): Promise<void> {
+    const s = this.session();
+    if (!s) {
+      vscode.window.showWarningMessage("请在 Markdown 文档中固化技能");
+      return;
+    }
+    let skills;
+    try {
+      skills = await apiSkills();
+    } catch (e) {
+      vscode.window.showErrorMessage(`获取技能库失败：${(e as Error).message}`);
+      return;
+    }
+    if (!skills.length) {
+      vscode.window.showInformationMessage("技能库为空（服务端 skills/ 目录无技能）");
+      return;
+    }
+    const pick = await vscode.window.showQuickPick(
+      skills.map((sk) => ({ label: sk.name, description: sk.description, skill: sk })),
+      { placeHolder: "选择要固化为系统提示词块的技能" }
+    );
+    if (!pick) return;
+    const content = skillSystemContent(pick.skill);
+    await s.editor.edit((e) =>
+      e.insert(new vscode.Position(0, 0), `<!-- system\n${content}\n-->\n\n`)
+    );
+    this.cb.statusBar(`已固化技能「${pick.label}」为系统提示词块（文档自包含）`);
     this.cb.refreshDecorations();
   }
 

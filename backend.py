@@ -149,15 +149,97 @@ def _common_prefix_len(a, b):
 
 _MIN_CACHE_REUSE = 16  # 公共前缀低于此 token 数不值得复用缓存
 
+# 思维链标签（Qwen3 / DeepSeek-R1 系本地模型内嵌输出）。
+# 拼接构造以避免标签字面量被工具链按 HTML 清洗。
+_THINK_OPEN = "<" + "thi" + "nk>"
+_THINK_CLOSE = "</" + "thi" + "nk>"
+
+
+class _ThinkSplitter:
+    """流式思维链分离器：把  simd…skill  文本流切成（思维链, 正文）。
+
+    仅处理流首的  simd（推理模型约定标签在输出最前）；无标签则全部为
+    正文。probe 态在开头未满标签长度时暂缓判定；think 态保留可能是
+    右标签前缀的尾部；content_start() 给出解码坐标下的正文起点，
+    供 token 对齐时剔除思考区 token（思维链不参与困惑度着色）。
+    """
+
+    def __init__(self):
+        self.state = "probe"      # probe | think | content
+        self._pending = ""        # probe 未决文本 / think 中右标签的候选前缀
+        self._fed = 0             # 已喂入总字符数（解码坐标）
+        self._content_start = 0   # 正文起点（仅 content 态有效）
+
+    def content_start(self):
+        """非正文前缀长度（解码坐标）；非 content 态返回 None（暂无正文）。"""
+        if self.state != "content":
+            return None
+        return self._content_start
+
+    def feed(self, chunk):
+        """喂入一段文本 → (思维链增量, 正文增量)。"""
+        if not chunk:
+            return "", ""
+        self._fed += len(chunk)
+        if self.state == "probe":
+            self._pending += chunk
+            if len(self._pending) < len(_THINK_OPEN) and _THINK_OPEN.startswith(self._pending):
+                return "", ""  # 仍可能是  simd 前缀：暂缓判定
+            if self._pending.startswith(_THINK_OPEN):
+                rest = self._pending[len(_THINK_OPEN):]
+                self.state, self._pending = "think", ""
+                return self._think(rest)
+            self.state, self._content_start = "content", 0
+            text, self._pending = self._pending, ""
+            return "", text
+        if self.state == "think":
+            return self._think(chunk)
+        return "", chunk
+
+    def _think(self, chunk):
+        self._pending += chunk
+        i = self._pending.find(_THINK_CLOSE)
+        if i < 0:
+            # 保留可能为右标签前缀的尾部，其余即思维链
+            keep = max(0, len(self._pending) - (len(_THINK_CLOSE) - 1))
+            out, self._pending = self._pending[:keep], self._pending[keep:]
+            return out, ""
+        reasoning = self._pending[:i]
+        rest = self._pending[i + len(_THINK_CLOSE):]
+        self._content_start = len(_THINK_OPEN) + len(reasoning) + len(_THINK_CLOSE)
+        self.state, self._pending = "content", ""
+        return reasoning, rest
+
+    def flush(self):
+        """流结束：未决文本归位（probe→正文；think 尾部→思维链）。"""
+        if self.state == "probe":
+            self.state, self._content_start = "content", 0
+            text, self._pending = self._pending, ""
+            return "", text
+        if self.state == "think":
+            out, self._pending = self._pending, ""
+            return out, ""
+        return "", ""
+
 
 @dataclass
 class GenUpdate:
     """一次流式生成的增量快照。"""
 
-    cum_text: str = ""                                   # 截至当前的累计生成文本
+    cum_text: str = ""                                   # 截至当前的累计生成文本（正文，不含思维链）
+    reasoning_cum: str = ""                              # 截至当前的累计思维链（推理模型）
     token_ppls: list = field(default_factory=list)       # 每个 token 的困惑度 exp(-logprob)
     token_texts: list = field(default_factory=list)      # 与 ppl 对齐的文本片段（增量解码差分）
+    reasoning_token_ppls: list = field(default_factory=list)  # 思考区 token 困惑度（本地后端）
+    reasoning_token_texts: list = field(default_factory=list) # 与其对齐的文本片段
     final: bool = False                                  # 是否为本次流式的最后一次更新
+
+
+# 推理模型名启发式（思维链支持静态推断的弱信号）
+_REASONING_NAME_HINTS = ("r1", "qwq", "reason", "thinking", "gpt-o", "glm-z", "glm4-z")
+
+# 思维链支持探测结果：yes=确定支持 no=确定不支持 unknown=待运行时检测
+ReasoningSupport = dict
 
 
 class LocalBackend:
@@ -178,6 +260,36 @@ class LocalBackend:
         self._cache_ids: list = []
         self.last_cache_info = ""  # 最近一次生成的缓存命中信息（UI 展示用）
         self._gen_thread: threading.Thread | None = None  # 当前生成线程（串行化用）
+        self.reasoning_seen = False  # 运行时检测：本模型曾输出思维链
+
+    # ------------------------------------------------------- 思维链能力探测
+    def _chat_template_text(self) -> str:
+        tpl = getattr(self.tokenizer, "chat_template", None)
+        if not isinstance(tpl, str) or not tpl:
+            # chat_template 可能是模板列表（多模板），拼起来检查
+            tpls = getattr(self.tokenizer, "chat_template", None)
+            return json.dumps(tpls, ensure_ascii=False) if tpls else ""
+        return tpl
+
+    def reasoning_support(self) -> ReasoningSupport:
+        """思维链能力：supported=yes/no/unknown；toggleable=模板支持开关。
+
+        静态信号：聊天模板含 enable_thinking 变量（Qwen3 系，可开关）或
+        模型名命中推理系关键词；unknown 则留待运行时检测（输出含
+        <think> 标签即确认）。
+        """
+        if not self.loaded:
+            return {"supported": "unknown", "toggleable": False}
+        tpl = self._chat_template_text()
+        toggleable = "enable_thinking" in tpl
+        if self.reasoning_seen:
+            return {"supported": "yes", "toggleable": toggleable}
+        name = (self.model_name or "").lower()
+        hinted = any(k in name for k in _REASONING_NAME_HINTS)
+        if hinted or toggleable:
+            return {"supported": "yes", "toggleable": toggleable}
+        # R1-Distill 类：模板无开关但输出内嵌 <think>；无法静态确定
+        return {"supported": "unknown", "toggleable": False}
 
     # ------------------------------------------------------------------ 加载
     @property
@@ -200,23 +312,29 @@ class LocalBackend:
         self.model.eval()
         self.model_name = model_path
         self._kv_cache, self._cache_ids, self.last_cache_info = None, [], ""
+        self.reasoning_seen = False
 
     # -------------------------------------------------------------- 聊天模板
-    def apply_chat_template(self, messages, active_text):
+    def apply_chat_template(self, messages, active_text, enable_thinking=None):
         """messages → 模板化生成前缀文本（含 assistant 起始标记）+ 活动块续写头。
 
         提示词块映射为 user 指令、生成块为 assistant 回复，使 Instruct 模型
         正确区分"指令"与"正文"，避免把提示词当正文续写。
+        enable_thinking：思考模式开关（仅模板含该变量时生效，如 Qwen3）；
+        None=跟随模型默认。
         """
+        kwargs = {}
+        if enable_thinking is not None and "enable_thinking" in self._chat_template_text():
+            kwargs["enable_thinking"] = bool(enable_thinking)
         prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
         return prompt + (active_text or "")
 
     # ----------------------------------------------------------- prompt 构造
-    def build_chat_prompt(self, messages, active_text):
+    def build_chat_prompt(self, messages, active_text, enable_thinking=None):
         """chat 模式：本地后端 → 应用聊天模板后的平文本 str。"""
-        return self.apply_chat_template(messages, active_text)
+        return self.apply_chat_template(messages, active_text, enable_thinking)
 
     def build_flat_prompt(self, flat_text):
         """prefix/raw 模式：本地后端 → 原样平文本 str。"""
@@ -359,32 +477,65 @@ class LocalBackend:
 
         # token-文本对齐（增量解码差分法）：逐 token decode 前缀取差分，
         # 片段与 ppl 一一对应，中文多字节字符跨 token 不乱码。
-        aligned_texts: list = []
+        # 思维链（simd…skill）：思考区 token 的 ppl 与正文同源，思维链
+        # 也可以困惑度着色（r_aligned）。
+        aligned: list = []   # (text, ppl) 仅正文 token
+        r_aligned: list = [] # (text, ppl) 思考区 token（思维链困惑度着色）
         aligned_len = 0
         seen = 0
         cum_text = ""
+        reasoning_cum = ""
+        splitter = _ThinkSplitter()
+
+        def _ppl_of(i):
+            return math.exp(min(-proc.log_probs[i], 20.0))
 
         def _pull_new_tokens():
             nonlocal seen, aligned_len
+            # probe/think 阶段暂不消费 token（正文尚未开始）；进入正文后
+            # 统一对齐：思考区 token 归思维链 ppl（本地后端思考 token 的
+            # log-prob 与正文同源，思维链同样可以困惑度着色）、跨界 token
+            # 拆两段各归其位
+            if splitter.state != "content":
+                return
+            head = splitter.content_start()
             # log_probs 滞后一步：仅对齐已有 ppl 的 token
             n_avail = min(len(streamer.token_ids), len(proc.log_probs))
             for i in range(seen, n_avail):
                 prefix_text = self.tokenizer.decode(
                     streamer.token_ids[: i + 1], skip_special_tokens=True
                 )
-                diff = prefix_text[aligned_len:]
-                aligned_texts.append(diff)
-                aligned_len += len(diff)
+                piece = prefix_text[aligned_len:]
+                aligned_len += len(piece)
                 seen = i + 1
+                if not piece:
+                    continue
+                start = aligned_len - len(piece)
+                if start >= head:
+                    aligned.append((piece, _ppl_of(i)))
+                elif aligned_len > head:
+                    # 跨界 token（含右标签）：前段入思维链、后段入正文
+                    r_aligned.append((piece[: head - start], _ppl_of(i)))
+                    aligned.append((piece[head - start:], _ppl_of(i)))
+                else:
+                    r_aligned.append((piece, _ppl_of(i)))
 
         try:
             for chunk in streamer:
                 if chunk:
-                    cum_text += chunk
+                    r, c = splitter.feed(chunk)
+                    reasoning_cum += r
+                    cum_text += c
+                if reasoning_cum:
+                    self.reasoning_seen = True
                 _pull_new_tokens()
-                ppls = [math.exp(min(-lp, 20.0)) for lp in proc.log_probs[:seen]]
                 yield GenUpdate(
-                    cum_text=cum_text, token_ppls=ppls, token_texts=list(aligned_texts)
+                    cum_text=cum_text,
+                    reasoning_cum=reasoning_cum,
+                    token_ppls=[p for _, p in aligned],
+                    token_texts=[t for t, _ in aligned],
+                    reasoning_token_ppls=[p for _, p in r_aligned],
+                    reasoning_token_texts=[t for t, _ in r_aligned],
                 )
         finally:
             # 收尾：join 线程；用保留的最后分布补齐尾部 token 的 log-prob
@@ -404,11 +555,18 @@ class LocalBackend:
                 proc.log_probs.append(proc.prev_logprobs[last_tok].item())
                 proc.prev_logprobs = None
             _pull_new_tokens()
-            _final_ppls = [math.exp(min(-lp, 20.0)) for lp in proc.log_probs[:seen]]
+            # 流结束：未闭合 simd 尾部归位（probe→正文），再消费被扣住的 token
+            r, c = splitter.flush()
+            reasoning_cum += r
+            cum_text += c
+            _pull_new_tokens()
             _final_snapshot = GenUpdate(
                 cum_text=cum_text,
-                token_ppls=_final_ppls,
-                token_texts=aligned_texts,
+                reasoning_cum=reasoning_cum,
+                token_ppls=[p for _, p in aligned],
+                token_texts=[t for t, _ in aligned],
+                reasoning_token_ppls=[p for _, p in r_aligned],
+                reasoning_token_texts=[t for t, _ in r_aligned],
                 final=True,
             )
             # 保存 KV 缓存供下次复用：完整序列 = prompt + 生成。保守裁掉
@@ -454,6 +612,20 @@ class LlamaCppBackend:
         self.context_size = 0       # 实际生效的上下文窗口
         self.last_cache_info = ""   # 最近一次生成的缓存命中信息（UI 展示用）
         self._stop_event = threading.Event()
+        self.reasoning_seen = False # 运行时检测：本模型曾输出思维链
+
+    # ------------------------------------------------------- 思维链能力探测
+    def reasoning_support(self) -> ReasoningSupport:
+        """GGUF 元数据/模型名推断；unknown 留待运行时检测（simd 标签）。"""
+        if not self.loaded:
+            return {"supported": "unknown", "toggleable": False}
+        if self.reasoning_seen:
+            return {"supported": "yes", "toggleable": False}
+        name = (self.model_name or "").lower()
+        tpl = self._meta().get("tokenizer.chat_template", "") or ""
+        if any(k in name for k in _REASONING_NAME_HINTS) or "enable_thinking" in tpl:
+            return {"supported": "yes", "toggleable": "enable_thinking" in tpl}
+        return {"supported": "unknown", "toggleable": False}
 
     # ------------------------------------------------------------------ 加载
     @property
@@ -477,12 +649,27 @@ class LlamaCppBackend:
         kwargs = dict(n_ctx=n_ctx, n_gpu_layers=int(n_gpu_layers), verbose=False)
         if os.path.exists(path):
             self._llm = llama_cpp.Llama(model_path=path, **kwargs)
+        elif "/" in path and path.lower().endswith(".gguf"):
+            # 仓库 ID 带文件名：org/repo/file.gguf → 指定量化文件下载
+            repo_id, _, filename = path.replace("\\", "/").rpartition("/")
+            self._llm = llama_cpp.Llama.from_pretrained(
+                repo_id=repo_id, filename=filename, **kwargs
+            )
         else:
             # HuggingFace GGUF 仓库 ID（下载仓库内 *.gguf；仓库含多个量化文件
-            # 时建议先下载到本地再填文件路径）
-            self._llm = llama_cpp.Llama.from_pretrained(
-                repo_id=path, filename="*.gguf", **kwargs
-            )
+            # 时 from_pretrained 会报错并列出可用文件，改填 仓库ID/文件名.gguf）
+            try:
+                self._llm = llama_cpp.Llama.from_pretrained(
+                    repo_id=path, filename="*.gguf", **kwargs
+                )
+            except Exception as e:  # noqa: BLE001
+                if "Multiple files found" in str(e):
+                    raise ValueError(
+                        f"仓库 {path} 含多个 GGUF 量化文件，请在路径后追加文件名"
+                        f"指定其一，例如 {path}/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+                        f"\n（完整列表见原始报错）\n原始错误：{e}"
+                    ) from e
+                raise
         self.model_name = path
         self.context_size = self._n_ctx()
         gpu = int(n_gpu_layers)
@@ -602,14 +789,19 @@ class LlamaCppBackend:
             resp = formatter.format_messages(list(messages))     # 旧版方法名
         return resp.prompt
 
-    def apply_chat_template(self, messages, active_text):
-        """messages → 模板化生成前缀文本（含 assistant 起始标记）+ 活动块续写头。"""
+    def apply_chat_template(self, messages, active_text, enable_thinking=None):
+        """messages → 模板化生成前缀文本（含 assistant 起始标记）+ 活动块续写头。
+
+        enable_thinking：llama-cpp-python 的 Jinja2ChatFormatter 不透传模板
+        变量，开关无法在此生效（思考与否取决于 GGUF 模板默认/服务端 jinja
+        配置）；保留参数以统一三后端 build_chat_prompt 签名。
+        """
         return self._render_chat(messages) + (active_text or "")
 
     # ----------------------------------------------------------- prompt 构造
-    def build_chat_prompt(self, messages, active_text):
+    def build_chat_prompt(self, messages, active_text, enable_thinking=None):
         """chat 模式：llama.cpp 后端 → 应用聊天模板后的平文本 str。"""
-        return self.apply_chat_template(messages, active_text)
+        return self.apply_chat_template(messages, active_text, enable_thinking)
 
     def build_flat_prompt(self, flat_text):
         """prefix/raw 模式：llama.cpp 后端 → 原样平文本 str。"""
@@ -724,10 +916,15 @@ class LlamaCppBackend:
             repeat_penalty=float(gen_params.get("repetition_penalty", 1.1)),
         )
 
-        cum_text = ""
+        cum_text = ""        # 仅正文（思维链经 _ThinkSplitter 分离）
+        reasoning_cum = ""
+        full_text = ""       # 含思维链的完整解码文本（差分基准）
         token_texts: list = []
         token_ppls: list = []
+        reasoning_token_texts: list = []
+        reasoning_token_ppls: list = []
         completion_tokens: list = []
+        splitter = _ThinkSplitter()
         n_gen = 0
         try:
             for token in gen:
@@ -737,24 +934,39 @@ class LlamaCppBackend:
                     break
                 # 困惑度：此刻 logits 缓冲区恰为产生该 token 的原始分布
                 logits = self._read_logits(np)
-                # token-文本对齐（增量解码差分法，同 LocalBackend）：逐 token
-                # 解码前缀取差分，中文多字节字符跨 token 不乱码（未完成字节
-                # 暂缺、完成后经差分补齐，"".join(token_texts)==cum_text 恒成立）
-                completion_tokens.append(token)
-                new_text = self._llm.detokenize(
-                    completion_tokens, prev_tokens=toks
-                ).decode("utf-8", errors="ignore")
-                piece = new_text[len(cum_text):]
-                cum_text = new_text
-                token_texts.append(piece)
+                ppl = None
                 if logits is not None:
                     m = float(logits.max())
                     lse = m + math.log(float(np.exp(logits - m).sum()))
                     lp = float(logits[token]) - lse
-                    token_ppls.append(math.exp(min(-lp, 20.0)))
+                    ppl = math.exp(min(-lp, 20.0))
+                # token-文本对齐（增量解码差分法，同 LocalBackend）：逐 token
+                # 解码前缀取差分，中文多字节字符跨 token 不乱码（未完成字节
+                # 暂缺、完成后经差分补齐，"".join(token_texts)==cum_text 恒成立）。
+                # 思考区 token 同样算 ppl（思维链也参与困惑度着色）
+                completion_tokens.append(token)
+                new_text = self._llm.detokenize(
+                    completion_tokens, prev_tokens=toks
+                ).decode("utf-8", errors="ignore")
+                piece = new_text[len(full_text):]
+                full_text = new_text
+                r, c = splitter.feed(piece)
+                reasoning_cum += r
+                cum_text += c
+                if r:
+                    self.reasoning_seen = True
+                    reasoning_token_texts.append(r)
+                    reasoning_token_ppls.append(ppl)
+                if c:
+                    token_texts.append(c)
+                    token_ppls.append(ppl)
                 yield GenUpdate(
-                    cum_text=cum_text, token_ppls=list(token_ppls),
+                    cum_text=cum_text,
+                    reasoning_cum=reasoning_cum,
+                    token_ppls=list(token_ppls),
                     token_texts=list(token_texts),
+                    reasoning_token_ppls=list(reasoning_token_ppls),
+                    reasoning_token_texts=list(reasoning_token_texts),
                 )
                 n_gen += 1
                 if n_gen >= max_tokens:
@@ -766,9 +978,15 @@ class LlamaCppBackend:
                     close()
                 except Exception:  # noqa: BLE001
                     pass
+            # 流结束：未闭合 simd 尾部归位
+            r, c = splitter.flush()
+            reasoning_cum += r
+            cum_text += c
         yield GenUpdate(
-            cum_text=cum_text, token_ppls=token_ppls,
-            token_texts=token_texts, final=True,
+            cum_text=cum_text, reasoning_cum=reasoning_cum,
+            token_ppls=token_ppls, token_texts=token_texts,
+            reasoning_token_ppls=reasoning_token_ppls,
+            reasoning_token_texts=reasoning_token_texts, final=True,
         )
 
 
@@ -790,7 +1008,8 @@ class OpenAICompatBackend:
         self.base_url = ""
         self.api_key = ""
         self.model = ""
-        self.supports_logprobs = None  # None=未探测（首次生成时探测）
+        self.supports_logprobs = None
+        self.reasoning_seen = False  # 运行时检测：响应含 reasoning_content 即支持
         self._stop_event = threading.Event()
         self._resp = None
 
@@ -817,6 +1036,7 @@ class OpenAICompatBackend:
 
         self.base_url, self.api_key, self.model = base, (api_key or "").strip(), model.strip()
         self.supports_logprobs = None
+        self.reasoning_seen = False
 
         # 连接验证：GET /models（401/403 = 鉴权失败；404/405 = 网关无此端点，放行）
         try:
@@ -830,9 +1050,11 @@ class OpenAICompatBackend:
         # 404/405：部分网关不实现 /models，放行，生成时再验证
 
     # ----------------------------------------------------------- prompt 构造
-    def build_chat_prompt(self, messages, active_text):
+    def build_chat_prompt(self, messages, active_text, enable_thinking=None):
         """chat 模式：API 后端 → messages 列表。活动块文本作为末尾 assistant
-        消息（prefill），模型以其为上文继续输出新内容。"""
+        消息（prefill），模型以其为上文继续输出新内容。
+        enable_thinking 由 generate_stream 落到请求参数（vLLM/SGLang 的
+        chat_template_kwargs），此处仅统一三后端签名。"""
         msgs = [dict(m) for m in messages]
         if (active_text or "").strip():
             msgs.append({"role": "assistant", "content": active_text})
@@ -841,6 +1063,18 @@ class OpenAICompatBackend:
     def build_flat_prompt(self, flat_text):
         """prefix/raw 模式：平文本包成单条 user 消息。"""
         return [{"role": "user", "content": flat_text}]
+
+    # ------------------------------------------------------- 思维链能力探测
+    def reasoning_support(self) -> ReasoningSupport:
+        """模型名启发式；unknown 留待运行时检测（响应含 reasoning_content）。"""
+        if not self.loaded:
+            return {"supported": "unknown", "toggleable": False}
+        if self.reasoning_seen:
+            return {"supported": "yes", "toggleable": True}
+        name = (self.model or "").lower()
+        if any(k in name for k in _REASONING_NAME_HINTS):
+            return {"supported": "yes", "toggleable": True}
+        return {"supported": "unknown", "toggleable": True}
 
     # -------------------------------------------------------------- 困惑度
     def compute_context_ppl(self, prompt) -> float:
@@ -861,11 +1095,16 @@ class OpenAICompatBackend:
         resp = requests.post(
             url, headers=self._headers(), json=payload, stream=True, timeout=(15, 600)
         )
-        if resp.status_code != 200 and "logprobs" in payload and resp.status_code == 400:
-            # 服务端不支持 logprobs 参数 → 去掉后重试一次并记住
+        # 400 降级重试：logprobs / chat_template_kwargs 服务端不支持时去掉再试
+        if resp.status_code == 400 and (
+            "logprobs" in payload or "chat_template_kwargs" in payload
+        ):
+            dropped = [k for k in ("logprobs", "chat_template_kwargs") if k in payload]
             resp.close()
-            self.supports_logprobs = False
-            payload.pop("logprobs")
+            if "logprobs" in dropped:
+                self.supports_logprobs = False
+            for k in dropped:
+                payload.pop(k)
             resp = requests.post(
                 url, headers=self._headers(), json=payload, stream=True, timeout=(15, 600)
             )
@@ -893,6 +1132,10 @@ class OpenAICompatBackend:
         )
         if self.supports_logprobs is not False:
             payload["logprobs"] = True
+        # 思考模式关闭（vLLM/SGLang 约定的 chat_template_kwargs；OpenAI
+        # 官方等不认识该参数 → 400 时自动降级去掉重试）
+        if gen_params.get("enable_thinking") is False:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         resp = self._post_stream(payload)
         self._resp = resp
@@ -900,6 +1143,7 @@ class OpenAICompatBackend:
             self.supports_logprobs = True  # 200 通过，待首条数据确认
 
         cum_text = ""
+        reasoning_cum = ""
         token_texts: list = []
         token_ppls: list = []
         final_snapshot = None
@@ -917,9 +1161,17 @@ class OpenAICompatBackend:
                 except json.JSONDecodeError:
                     continue
                 choice = (chunk.get("choices") or [{}])[0]
-                piece = (choice.get("delta") or {}).get("content") or ""
+                delta = choice.get("delta") or {}
+                piece = delta.get("content") or ""
+                # 思维链（DeepSeek/GLM/Qwen 的 reasoning_content；部分服务
+                # 用 reasoning 字段）。API 不返回 reasoning 的 logprobs，
+                # 思维链困惑度着色仅本地/llama.cpp 后端可用
+                rpiece = delta.get("reasoning_content") or delta.get("reasoning") or ""
                 if piece:
                     cum_text += piece
+                if rpiece:
+                    reasoning_cum += rpiece
+                    self.reasoning_seen = True
                 # logprobs 逐 token 困惑度（服务端支持时）
                 for ent in (choice.get("logprobs") or {}).get("content") or []:
                     tok = ent.get("token") or ""
@@ -928,7 +1180,9 @@ class OpenAICompatBackend:
                         token_texts.append(tok)
                         token_ppls.append(math.exp(min(-logprob, 20.0)))
                 yield GenUpdate(
-                    cum_text=cum_text, token_ppls=list(token_ppls),
+                    cum_text=cum_text,
+                    reasoning_cum=reasoning_cum,
+                    token_ppls=list(token_ppls),
                     token_texts=list(token_texts),
                 )
         except (ValueError, requests.RequestException):
@@ -944,7 +1198,7 @@ class OpenAICompatBackend:
             if self.supports_logprobs and not token_ppls:
                 self.supports_logprobs = False  # 200 但从未返回 logprobs 数据
             final_snapshot = GenUpdate(
-                cum_text=cum_text, token_ppls=token_ppls,
-                token_texts=token_texts, final=True,
+                cum_text=cum_text, reasoning_cum=reasoning_cum,
+                token_ppls=token_ppls, token_texts=token_texts, final=True,
             )
         yield final_snapshot

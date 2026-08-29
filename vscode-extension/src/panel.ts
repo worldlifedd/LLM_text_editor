@@ -98,7 +98,7 @@ svg { width: 100%; height: 130px; }
     <div id="localRow" class="row"><label>模型路径/ID</label>
       <input type="text" id="modelPath" value="Qwen/Qwen2.5-0.5B-Instruct"></div>
     <div id="llamaRow" class="row" style="display:none"><label>GGUF 路径/仓库</label>
-      <input type="text" id="llamaPath" placeholder="models/qwen2.5-0.5b-instruct-q4_k_m.gguf"></div>
+      <input type="text" id="llamaPath" value="Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf"></div>
     <div id="llamaRow2" class="row" style="display:none"><label>n_gpu_layers</label>
       <input type="number" id="llamaGpu" value="-1" min="-1" max="100" step="1"></div>
     <div id="llamaRow3" class="row" style="display:none"><label>n_ctx</label>
@@ -131,8 +131,17 @@ svg { width: 100%; height: 130px; }
         <option value="raw">raw（原文裸拼接）</option>
       </select>
     </div>
+    <div class="row"><label>🧠 思考模式</label>
+      <select id="pThink">
+        <option value="auto">auto（模型默认）</option>
+        <option value="on">on（强制思考）</option>
+        <option value="off">off（关闭思考·提速）</option>
+      </select>
+    </div>
+    <div class="tip" id="reasoningInfo">思维链能力：未知（加载模型后显示）</div>
     <button id="genBtn">▶ 生成（当前文档）</button>
     <button class="secondary" id="stopBtn">⏹ 停止</button>
+    <div class="tip">生成中按钮自动变为"⏹ 停止"，同一按键切换；快捷键 Ctrl+Enter</div>
   </div>
 
   <h3>🧩 技能库</h3>
@@ -160,7 +169,14 @@ svg { width: 100%; height: 130px; }
 const vscode = acquireVsCodeApi();
 const $ = (id) => document.getElementById(id);
 
+// 用户手动改过 mode 后，不再被服务端 status.kind 反向覆盖：
+// 服务端 _ACTIVE.kind 默认 "local"，仅在"加载成功后"才变为 llamacpp/api。
+// 若无条件用 status.kind 覆盖，用户刚选 llamacpp、还没加载，下一次轮询就会
+// 把 UI（含 GGUF 输入框）切回 local，导致发出空 model_path → 报"不能为空"。
+let userPickedMode = false;
 function setMode(m) {
+  // 同步下拉框，保证 select 显示与各 row 显隐一致
+  $("mode").value = m;
   const api = m === "api";
   const llama = m === "llamacpp";
   $("localRow").style.display = api || llama ? "none" : "";
@@ -174,6 +190,7 @@ function setMode(m) {
 }
 
 function collectParams() {
+  const think = $("pThink").value;
   return {
     max_new_tokens: parseInt($("pMax").value, 10) || 256,
     do_sample: $("pSample").checked,
@@ -181,13 +198,17 @@ function collectParams() {
     top_k: parseInt($("pTopK").value, 10) || 50,
     top_p: parseFloat($("pTopP").value) || 0.95,
     repetition_penalty: parseFloat($("pRep").value) || 1.1,
+    enable_thinking: think === "auto" ? null : think === "on",
   };
 }
 function collectSkills() {
   return Array.from(document.querySelectorAll("#skillsList input:checked")).map((c) => c.value);
 }
 
-$("mode").addEventListener("change", (e) => setMode(e.target.value));
+$("mode").addEventListener("change", (e) => {
+  userPickedMode = true;
+  setMode(e.target.value);
+});
 $("loadBtn").addEventListener("click", () => {
   const mode = $("mode").value;
   if (mode === "local") {
@@ -244,7 +265,21 @@ window.addEventListener("message", (ev) => {
   if (msg.type === "status") {
     const s = msg.status;
     $("status").textContent = s.message || "未加载";
-    if (s.kind) setMode(s.kind);
+    // 思维链能力展示（supported 三态 + 可开关提示）
+    if (s.reasoning && s.loaded) {
+      const r = s.reasoning;
+      let txt = "思维链能力：";
+      if (r.supported === "yes") txt += "✅ 支持";
+      else if (r.supported === "no") txt += "❌ 不支持";
+      else txt += "❓ 待检测（生成时自动确认）";
+      if (r.toggleable) txt += "（可用思考模式开关）";
+      $("reasoningInfo").textContent = txt;
+    } else {
+      $("reasoningInfo").textContent = "思维链能力：未知（加载模型后显示）";
+    }
+    // 仅在用户尚未手动选择时，用服务端当前后端初始化面板；
+    // 用户一旦选过，以用户为准，避免加载前的轮询把 UI 切回 local。
+    if (s.kind && !userPickedMode) setMode(s.kind);
   } else if (msg.type === "skills") {
     const box = $("skillsList");
     if (!msg.skills || !msg.skills.length) {
@@ -263,13 +298,16 @@ window.addEventListener("message", (ev) => {
     $("pTopP").value = msg.params.top_p;
     $("pRep").value = msg.params.repetition_penalty;
     $("pMode").value = msg.context_mode || "chat";
+    const et = msg.params.enable_thinking;
+    $("pThink").value = et == null ? "auto" : et ? "on" : "off";
   } else if (msg.type === "ppl") {
     $("ctxPpl").textContent = msg.ctxPpl == null ? "—（本地/llama.cpp 模式）" : String(msg.ctxPpl);
     $("avgPpl").textContent = msg.avgPpl == null ? "—" : msg.avgPpl.toFixed(2);
     $("cacheInfo").textContent = msg.cacheInfo || "";
     drawChart(msg.series);
   } else if (msg.type === "gen") {
-    $("genBtn").disabled = msg.generating;
+    // 生成/停止同一按键切换：按钮文案反映当前 LLM 工作状态
+    $("genBtn").textContent = msg.generating ? "⏹ 停止生成（进行中…）" : "▶ 生成（当前文档）";
   }
 });
 </script>

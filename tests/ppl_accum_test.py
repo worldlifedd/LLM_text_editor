@@ -104,6 +104,6 @@ assert "提示词不该出现" not in hm6
 
 print("[8] 序列化兼容（ppl 键不写入文件）...")
 doc = app.serialize_doc(blocks3, text2)
-assert "token_ppls" not in doc and "<generate>" in doc
+assert "token_ppls" not in doc and "<!-- generate -->" in doc
 
 print("ALL PPL ACCUMULATION TESTS PASSED ✔")

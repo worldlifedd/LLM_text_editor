@@ -8,22 +8,65 @@ import math
 import re
 
 # ==================================================================== 文档序列化
+# 纯 Markdown 格式：提示词块 = <!-- prompt ... --> 注释（渲染不可见）；
+# 系统块 = <!-- system ... --> 注释（技能等系统级指令，渲染不可见）；
+# 思维链块 = <!-- cot ... --> 注释（模型推理过程，渲染不可见、源码可编辑）；
+# 生成块 = 可见正文，前置 <!-- generate --> 注释作为块边界标记
+# （用于分隔相邻生成块、保留空的活动生成单元）。
+# 技能可固化为 system 块写入文档，使文档自包含、可在无该技能的环境复现生成。
+_TOKEN_RE = re.compile(
+    r"<!--\s*(?:(?:(prompt|system|cot)\b(?::\s*|\s+)(.*?)\s*-->)|(generate)\s*-->)",
+    re.S,
+)
+
+
 def serialize_doc(blocks, active_text):
-    """历史块 + 活动单元（作为最后一个 generate 块）→ Markdown + XML 文本。"""
+    """历史块 + 活动单元（作为最后一个 generate 块）→ 纯 Markdown 文本。"""
     parts = []
     for blk in blocks:
-        tag = "prompt" if blk["type"] == "prompt" else "generate"
-        parts.append(f"<{tag}>\n{blk['content'].strip()}\n</{tag}>")
-    if active_text.strip():
-        parts.append(f"<generate>\n{active_text.strip()}\n</generate>")
+        c = (blk.get("content") or "").strip()
+        t = blk["type"]
+        if t == "prompt":
+            parts.append(f"<!-- prompt\n{c}\n-->")
+        elif t == "system":
+            parts.append(f"<!-- system\n{c}\n-->")
+        elif t == "cot":
+            parts.append(f"<!-- cot\n{c}\n-->")
+        else:
+            parts.append(f"<!-- generate -->\n{c}")
+    a = (active_text or "").strip()
+    if a:
+        parts.append(f"<!-- generate -->\n{a}")
     return "\n\n".join(parts) + "\n"
 
 
 def parse_doc(text):
-    """解析 Markdown+XML 文本 → (blocks, active_text)。最后一个 generate 进活动单元。"""
+    """解析纯 Markdown 文本 → (blocks, active_text)。
+
+    <!-- prompt/system/cot ... --> 注释 → 对应块；<!-- generate --> 标记后的
+    可见文本 → 生成块；紧随注释的裸文本也归入生成块。最后一个 generate 进活动单元。
+    """
     blocks = []
-    for m in re.finditer(r"<(prompt|generate)>\s*(.*?)\s*</\1>", text, re.S):
-        blocks.append({"type": m.group(1), "content": m.group(2).strip()})
+    pos = 0
+    pending_gen = False  # 上一 token 是 generate 标记，等待其内容
+    for m in _TOKEN_RE.finditer(text):
+        c = text[pos:m.start()].strip()
+        if pending_gen:
+            blocks[-1]["content"] = c
+            pending_gen = False
+        elif c:
+            blocks.append({"type": "generate", "content": c})
+        if m.group(3):  # generate 边界标记
+            blocks.append({"type": "generate", "content": ""})
+            pending_gen = True
+        else:  # prompt / system / cot 注释
+            blocks.append({"type": m.group(1), "content": (m.group(2) or "").strip()})
+        pos = m.end()
+    c = text[pos:].strip()
+    if pending_gen:
+        blocks[-1]["content"] = c
+    elif c:
+        blocks.append({"type": "generate", "content": c})
     active = ""
     if blocks and blocks[-1]["type"] == "generate":
         active = blocks[-1]["content"]
@@ -135,22 +178,44 @@ def build_flat_context(blocks, active_text, skill_ctx, mode):
     return "\n\n".join(parts)
 
 
-def build_prompt(blocks, active_text, skill_ctx, mode, backend):
+def extract_system(blocks, skill_ctx):
+    """抽取文档内 system 块并与本地技能上下文合并 → (system_ctx, 其余块)。
+
+    system 块（固化技能等）在前，本地技能在后；使文档自包含、
+    可在无对应技能的环境中复现生成。
+    """
+    blocks = blocks or []
+    sys_parts = [
+        b["content"].strip() for b in blocks
+        if b.get("type") == "system" and (b.get("content") or "").strip()
+    ]
+    if skill_ctx and skill_ctx.strip():
+        sys_parts.append(skill_ctx.strip())
+    system_ctx = "\n\n".join(sys_parts)
+    rest = [b for b in blocks if b.get("type") != "system"]
+    return system_ctx, rest
+
+
+def build_prompt(blocks, active_text, skill_ctx, mode, backend, enable_thinking=None):
     """构造 backend 专属 prompt。
 
     上下文模式：
-    - chat:   提示词块→user 指令、生成块→assistant 回复（本地=聊天模板
-              包装文本；API=messages 列表）
-    - prefix: 提示词块加【指令】前缀、生成块加【正文】前缀后拼接
+    - chat:   系统块/技能→system、提示词块→user 指令、生成块→assistant 回复
+              （本地=聊天模板包装文本；API=messages 列表）
+    - prefix: 系统块/技能加【指令】前缀、提示词块加【指令】前缀、
+              生成块加【正文】前缀后拼接
     - raw:    全部块原文裸拼接（纯续写场景）
     """
-    blocks = blocks or []
+    system_ctx, blocks = extract_system(blocks or [], skill_ctx)
+    # 思维链块不进上下文：推理模型会自行重新思考，回灌旧思维链反而干扰
+    # （DeepSeek 官方亦建议后续请求不携带 reasoning_content）
+    blocks = [b for b in blocks if b.get("type") != "cot"]
     active = (active_text or "").strip()
-    skill = skill_ctx or ""
+    skill = system_ctx or ""
     if mode == "chat":
         msgs = blocks_to_messages(blocks, skill)
         if not any(m["role"] == "user" for m in msgs):
             return ""  # chat 模式必须有指令，否则退化为无意义模板
-        return backend.build_chat_prompt(msgs, active)
+        return backend.build_chat_prompt(msgs, active, enable_thinking)
     flat = build_flat_context(blocks, active, skill, mode)
     return backend.build_flat_prompt(flat)

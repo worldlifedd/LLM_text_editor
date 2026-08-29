@@ -15,12 +15,20 @@ export interface FinalizedPpl {
 
 export interface DocState {
   activePpl: PplSeg;
+  /** 活动思维链块（紧邻活动生成块的 cot 注释）的 ppl——本地后端思考
+   * token 的 log-prob 与正文同源，思维链同样可困惑度着色 */
+  activeCotPpl: PplSeg;
   finalized: Map<number, FinalizedPpl>;
   locked: Set<number>;
 }
 
 function newState(): DocState {
-  return { activePpl: emptyPpl(), finalized: new Map(), locked: new Set() };
+  return {
+    activePpl: emptyPpl(),
+    activeCotPpl: emptyPpl(),
+    finalized: new Map(),
+    locked: new Set(),
+  };
 }
 
 export class StateStore {

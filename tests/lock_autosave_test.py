@@ -67,15 +67,15 @@ with tempfile.TemporaryDirectory() as td:
             app.on_autosave([{"type": "prompt", "content": f"x{i}"}], "y", True)
         n = len(glob.glob(os.path.join(td, "autosave_*.md")))
         assert n == app._AUTOSAVE_KEEP, f"轮转失败：{n} != {app._AUTOSAVE_KEEP}"
-        # 文件内容合法（XML 标记）
+        # 文件内容合法（纯 Markdown：prompt 为注释、generate 为可见正文）
         with open(glob.glob(os.path.join(td, "autosave_*.md"))[0], encoding="utf-8") as f:
-            assert "<prompt>" in f.read()
+            assert "<!-- prompt" in f.read()
     finally:
         app.SAVE_DIR = old_dir
 print("    ✔ 落盘/去重/开关/空文档/轮转均通过")
 
 print("[5] 序列化不包含 locked 键 ...")
 doc = app.serialize_doc([{"type": "prompt", "content": "p1", "locked": True}], "")
-assert "locked" not in doc and "<prompt>" in doc
+assert "locked" not in doc and "<!-- prompt" in doc
 
 print("ALL LOCK + AUTOSAVE TESTS PASSED ✔")

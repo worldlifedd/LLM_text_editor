@@ -14,7 +14,14 @@ const PY_FILES = ["server.py", "core.py", "backend.py", "skills.py", "requiremen
 function copyPython() {
   const root = path.resolve(__dirname, "..");
   const dest = path.join(__dirname, "python");
-  fs.rmSync(dest, { recursive: true, force: true });
+  try {
+    fs.rmSync(dest, { recursive: true, force: true });
+  } catch (e) {
+    // python/ 被占用（如 server.py 正在运行）时跳过重建；
+    // 开发态用 gte.serverScript 指向仓库根 server.py，不依赖此副本。
+    console.warn(`[bundle] python/ 删除失败，跳过同步：${e.code}`);
+    return;
+  }
   fs.mkdirSync(dest, { recursive: true });
   for (const f of PY_FILES) {
     fs.copyFileSync(path.join(root, f), path.join(dest, f));
