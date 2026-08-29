@@ -9,3 +9,7 @@ node_modules/
 vscode-extension/dist/
 # VSIX 打包产物：构建时由 esbuild.js 从仓库根自动复制
 vscode-extension/python/
+# 隐藏目录与运行时产物（不提交）
+.plans/
+.vscode/
+models/
