@@ -29,6 +29,9 @@ export interface GenUpdate {
   /** 思维链困惑度（本地/llama.cpp 后端；API 无 reasoning logprobs） */
   reasoning_token_texts?: string[];
   reasoning_token_ppls?: (number | null)[];
+  /** 思考区是否闭合（模型输出过闭标签）；未闭合时插件端不补写闭标签，
+   *  cot 保持"续写思考"状态（所见即所得，用户可删/留闭标签控制行为） */
+  reasoning_closed?: boolean;
   final: boolean;
   cache_info?: string;
 }
@@ -40,8 +43,16 @@ export interface SkillInfo {
   instructions: string;
 }
 
+export interface PrefillPpl {
+  /** 活动块文本（含手动编辑部分）的逐 token 困惑度片段；
+   * join(token_texts) 为 active_text 的后缀 */
+  token_texts: string[];
+  token_ppls: (number | null)[];
+}
+
 export interface GenerateHandlers {
   onCtxPpl?: (ppl: number) => void;
+  onPrefillPpl?: (d: PrefillPpl) => void;
   onUpdate: (u: GenUpdate) => void;
   onError: (msg: string) => void;
   onDone?: () => void;
@@ -133,6 +144,8 @@ export async function apiGenerate(
     }
     if (eventName === "ctx_ppl") {
       handlers.onCtxPpl?.((data as { ppl: number }).ppl);
+    } else if (eventName === "prefill_ppl") {
+      handlers.onPrefillPpl?.(data as PrefillPpl);
     } else if (eventName === "update") {
       const u = data as GenUpdate;
       handlers.onUpdate(u);

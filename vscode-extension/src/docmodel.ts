@@ -1,3 +1,7 @@
+// DEPRECATED：基于文本标记与 offset 账本的文档模型已被 server.py 托管的
+// Web 块编辑器（web/model.js + web/editor.js，块数组为唯一数据源）取代，
+// 本文件保留作回退，不再修复/增强。
+//
 // 文档模型：解析纯 Markdown 文档为带偏移的块列表。
 // 提示词块 = <!-- prompt ... --> 注释、系统块 = <!-- system ... --> 注释、
 // 思维链块 = <!-- cot ... --> 注释（均渲染不可见）；生成块 = 可见正文，
@@ -13,8 +17,14 @@ export interface Block {
   content: string; // strip 后的内容
   /** 内容起始 offset（紧邻开头空白之后） */
   contentStart: number;
-  /** 内容结束 offset（结尾空白之前，即插入点） */
+  /** 内容结束 offset（结尾空白之前）。注意：流式追加不能用它当插入点，
+   *  content 已被剥离尾部空白，插这里会把空白挤到后面去 */
   contentEnd: number;
+  /** 流式追加插入点：注释块为 `-->` 之前，可见文本块为块末尾。
+   *  追加语义必须用它——contentEnd 会跳过尾部空白，导致逐段插入时
+   *  空白不断被挤到末尾（思维链里所有换行/空格丢失、末尾堆一堆空白），
+   *  更糟的是文档内容会与服务端 token 序列错位，困惑度着色随之失效。 */
+  insertEnd: number;
   /** 整个块（含标记/注释）的起始 offset */
   blockStart: number;
   /** 整个块（含标记/注释与其后内容）的结束 offset */
@@ -33,6 +43,30 @@ const TOKEN_RE =
   /<!--\s*(?:(prompt|system|cot)\b(?::\s*|\s+)([\s\S]*?)\s*-->|(generate)\s*-->)/g;
 // prompt/system/cot 注释前缀（贪婪匹配到内容首字符，与 TOKEN_RE 分隔符一致）
 const NOTE_OPEN_RE = /^<!--\s*(prompt|system|cot)\b(?::\s*|\s+)/;
+/** 注释结束标记，insertEnd 要落在它之前 */
+const NOTE_CLOSE = "-->";
+
+// 思维链标签（拼接构造，避免字面量被工具链按 HTML 清洗，同 backend.py）
+export const THINK_OPEN = "<" + "thi" + "nk>";
+export const THINK_CLOSE = "</" + "thi" + "nk>";
+
+/**
+ * 提取 cot 块中的纯思考文本：去掉 `<think>` 前缀与闭标签后缀。
+ *
+ * cot 块自包含完整思考区（所见即所得：用户删掉闭标签 → 下次续写思考；
+ * 保留 → 直接出正文）。服务端返回的 reasoning_cum 只含纯思考文本，两者
+ * 对账/着色时必须剔除标签，否则前缀就对不上。
+ */
+export function cotBody(content: string): string {
+  let s = content;
+  const oi = s.indexOf(THINK_OPEN);
+  if (oi >= 0) s = s.slice(oi + THINK_OPEN.length);
+  if (s.startsWith("\n")) s = s.slice(1); // 分隔符 <think>\n
+  const ci = s.lastIndexOf(THINK_CLOSE);
+  if (ci >= 0) s = s.slice(0, ci);
+  if (s.endsWith("\n")) s = s.slice(0, -1); // 分隔符 \n</think>
+  return s;
+}
 
 export function parseDoc(text: string): ParsedDoc {
   const blocks: Block[] = [];
@@ -51,6 +85,8 @@ export function parseDoc(text: string): ParsedDoc {
       pendingGen.contentStart = pendingGen.blockEnd + leadWs;
       pendingGen.contentEnd = pendingGen.contentStart + content.length;
       pendingGen.blockEnd = end;
+      // 可见文本块：追加到块末尾（其后的空白属于下一块/文末间隙）
+      pendingGen.insertEnd = end;
       pendingGen = null;
     } else if (content) {
       blocks.push({
@@ -58,6 +94,7 @@ export function parseDoc(text: string): ParsedDoc {
         content,
         contentStart: pos + leadWs,
         contentEnd: pos + leadWs + content.length,
+        insertEnd: end,
         blockStart: pos,
         blockEnd: end,
         index: blocks.length,
@@ -80,6 +117,9 @@ export function parseDoc(text: string): ParsedDoc {
         content,
         contentStart: matchStart + openLen,
         contentEnd: matchStart + openLen + content.length,
+        // 追加点落在注释结束标记之前：content 已被剥离尾部空白（TOKEN_RE
+        // 的 \s*-->），若插在 contentEnd 会把已有尾部空白挤到新内容之后
+        insertEnd: matchStart + fullMatch.length - NOTE_CLOSE.length,
         blockStart: matchStart,
         blockEnd: matchStart + fullMatch.length,
         index: blocks.length,
@@ -91,6 +131,7 @@ export function parseDoc(text: string): ParsedDoc {
         content: "",
         contentStart: matchStart + fullMatch.length,
         contentEnd: matchStart + fullMatch.length,
+        insertEnd: matchStart + fullMatch.length,
         blockStart: matchStart,
         blockEnd: matchStart + fullMatch.length,
         index: blocks.length,
@@ -101,11 +142,25 @@ export function parseDoc(text: string): ParsedDoc {
   }
   closeSegment(text.length);
 
-  let active: Block | null = null;
-  if (blocks.length && blocks[blocks.length - 1].type === "generate") {
-    active = blocks[blocks.length - 1];
+  // 末尾无生成块时虚拟一个空活动块（不对应任何文档文本，位置在文末）。
+  // 这样"末位是活动生成块、倒数第二是紧邻的 cot"这一假设恒成立：
+  // - 续写永远从文档末尾开始，用户误删 <!-- generate --> 也不会插错位置；
+  // - 首次生成不再需要插入一个语义冗余的 <!-- generate --> 标记占位。
+  // 与 Python 端保持兼容：空活动块等价于 core.parse_doc 返回的 active=""。
+  if (!blocks.length || blocks[blocks.length - 1].type !== "generate") {
+    const end = text.length;
+    blocks.push({
+      type: "generate",
+      content: "",
+      contentStart: end,
+      contentEnd: end,
+      insertEnd: end,
+      blockStart: end,
+      blockEnd: end,
+      index: blocks.length,
+    });
   }
-  return { blocks, active };
+  return { blocks, active: blocks[blocks.length - 1] };
 }
 
 /** 序列化为纯 Markdown 文本（与 Python serialize_doc 一致）。 */

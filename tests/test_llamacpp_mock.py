@@ -303,6 +303,28 @@ assert abs(ppl - PPL_ONEHOT) < 1e-6, ppl
 assert math.isnan(be.compute_context_ppl("   "))  # 空文本
 print("[10] compute_context_ppl OK:", round(ppl, 4))
 
+# 10b. score_context：同趟产出整段 ppl + 尾部（活动块文本）逐 token ppl
+ctx, tt, tp = be.score_context("秋秋秋秋", "秋秋")
+assert abs(ctx - PPL_ONEHOT) < 1e-6, ctx
+assert tt == ["秋", "秋"], tt  # detokenize 差分对齐
+assert len(tp) == 2 and all(abs(p - PPL_ONEHOT) < 1e-6 for p in tp), tp
+# 尾部非 context 后缀 → 放弃（空列表）
+_, tt2, tp2 = be.score_context("秋秋秋秋", "风")
+assert tt2 == [] and tp2 == []
+# 空尾部 / 空文本
+_, tt3, _ = be.score_context("秋秋秋秋", "")
+assert tt3 == []
+_ctx9, tt9, tp9 = be.score_context("  ", "秋")
+assert math.isnan(_ctx9) and tt9 == [] and tp9 == []
+# 尾部 == 整个文本（首 token 无前置分布）→ 放弃
+_, tt4, _ = be.score_context("秋秋秋秋", "秋秋秋秋")
+assert tt4 == []
+# 尾部跨 token 边界错位（头部 tokenize 非全量前缀）不会在此词表出现，
+# 以 mock 单字 token 特性覆盖等价场景：头部 2 token 边界精确对齐
+_, tt5, tp5 = be.score_context("秋风秋风", "秋风")
+assert tt5 == ["秋", "风"] and len(tp5) == 2, (tt5, tp5)
+print("[10b] score_context tail ppl OK:", tt, [round(p, 3) for p in tp])
+
 # 11. 超长 prompt：保留尾部（最新上下文，n_ctx-8 截断；_n_ctx 有 512 下限）
 fake.n_ctx = 520
 fake.gen_seq = [10, 11]
@@ -315,5 +337,44 @@ print("[11] long-prompt tail truncation OK: len =", len(sent))
 fake.n_ctx = lambda: 999
 assert be._n_ctx() == 999
 print("[12] n_ctx attr/callable compat OK")
+
+# 13. 思维链流式分离：开标签在生成流内（DeepSeek-R1 / Qwen3 默认形态）
+# 扩展词表以支持 <think> / <<arg_key:6124c78e>> 的逐字符 detokenize
+for _i, _ch in enumerate("<>/think"):
+    VOCAB[23 + _i] = _ch     # N_VOCAB=32，23..30 空闲
+    CHAR2ID[_ch] = 23 + _i
+O = "<" + "thi" + "nk>"
+C = "</" + "thi" + "nk>"
+
+
+def _ids(s):
+    return [CHAR2ID[c] for c in s]
+
+
+be, Llama = _fresh_backend()
+fake = _load_fake(be, Llama, n_gpu_layers=0, n_ctx=1024)
+fake.gen_seq = _ids(O + "秋风" + C + "起了") + [EOS]
+final = list(be.generate_stream("写散文", max_new_tokens=64, do_sample=False))[-1]
+assert final.reasoning_cum == "秋风", final.reasoning_cum
+assert final.cum_text == "起了", final.cum_text
+assert "".join(final.reasoning_token_texts) == final.reasoning_cum
+print("[13] 思维链分离（开标签在流内）OK:", repr(final.reasoning_cum), repr(final.cum_text))
+
+# 14. 开标签已在 prompt 内（Qwen3 enable_thinking=true 渲染出未闭合的 <think>）：
+#     流首即思考正文且未闭合 → 全靠 flush 把暂缓的尾部补回。
+#     这是"思维链不着色"的回归点：若 flush 的 r 没同步进 token 序列，
+#     join(reasoning_token_texts) 会比 reasoning_cum 短，插件端对账失配。
+be, Llama = _fresh_backend()
+fake = _load_fake(be, Llama, n_gpu_layers=0, n_ctx=1024)
+fake.gen_seq = _ids("秋风起了，") + [EOS]
+final = list(be.generate_stream("写散文" + O + "\n", max_new_tokens=64, do_sample=False))[-1]
+assert final.reasoning_cum == "秋风起了，", final.reasoning_cum
+assert final.cum_text == "", final.cum_text
+assert "".join(final.reasoning_token_texts) == final.reasoning_cum, (
+    "".join(final.reasoning_token_texts), final.reasoning_cum,
+)
+assert len(final.reasoning_token_ppls) == len(final.reasoning_token_texts)
+print("[14] 思维链分离 + flush 补尾（开标签在 prompt 内）OK:",
+      repr(final.reasoning_cum), "| token 段数", len(final.reasoning_token_texts))
 
 print("ALL LLAMACPP MOCK TESTS PASSED")

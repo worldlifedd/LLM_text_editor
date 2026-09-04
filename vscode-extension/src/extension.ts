@@ -1,4 +1,8 @@
 // 插件入口：命令注册、状态栏、装饰监听、面板接线。
+// DEPRECATED：「编辑 Markdown 源码 + 文本标记识别块」模式已被 server.py
+// 托管的 Web 块编辑器（web/）取代——块边界是 UI 元素而非文本标记，
+// 严格所见即所得。本插件保留作回退，不再修复/增强；后续计划以
+// Custom Editor（Webview）复用 web/ 内核重写。
 import * as vscode from "vscode";
 import { apiLoad, apiSkills, GenParams } from "./api";
 import { Decorator, foldingRanges } from "./decorations";

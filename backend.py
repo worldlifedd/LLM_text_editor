@@ -156,25 +156,46 @@ _THINK_CLOSE = "</" + "thi" + "nk>"
 
 
 class _ThinkSplitter:
-    """流式思维链分离器：把  simd…skill  文本流切成（思维链, 正文）。
+    """流式思维链分离器：把 <think>…</think> 文本流切成（思维链, 正文）。
 
-    仅处理流首的  simd（推理模型约定标签在输出最前）；无标签则全部为
-    正文。probe 态在开头未满标签长度时暂缓判定；think 态保留可能是
-    右标签前缀的尾部；content_start() 给出解码坐标下的正文起点，
-    供 token 对齐时剔除思考区 token（思维链不参与困惑度着色）。
+    两种起始形态（推理模型约定思考区在输出最前）：
+    - 开标签在生成流内：如 DeepSeek-R1 / Qwen3 默认输出，流首即 <think>；
+      初始 probe 态先判定是否命中开标签，未命中则整段视为正文。
+    - 开标签已在 prompt 内：Qwen3 系模板在 enable_thinking=true 时渲染出的
+      prompt 以未闭合的 <think> 结尾，生成流直接从思考正文开始、只含闭标签；
+      此时须以 assume_thinking=True 构造，否则思考内容会被整段误判为正文，
+      且闭标签会原样泄漏进正文。
+
+    think 态保留可能是右标签前缀的尾部；content_start() 给出解码坐标下的
+    正文起点，供 token 对齐时剔除思考区 token。
     """
 
-    def __init__(self):
-        self.state = "probe"      # probe | think | content
+    def __init__(self, assume_thinking: bool = False):
+        # assume_thinking：prompt 已带开标签，流首即思考正文（跳过 probe 判定）
+        self.state = "think" if assume_thinking else "probe"
+        self._open_len = 0 if assume_thinking else len(_THINK_OPEN)
         self._pending = ""        # probe 未决文本 / think 中右标签的候选前缀
         self._fed = 0             # 已喂入总字符数（解码坐标）
         self._content_start = 0   # 正文起点（仅 content 态有效）
+        self.closed = False       # 流中是否出现过思考区闭标签（供前端补写/冻结）
 
     def content_start(self):
         """非正文前缀长度（解码坐标）；非 content 态返回 None（暂无正文）。"""
         if self.state != "content":
             return None
         return self._content_start
+
+    def reasoning_start(self):
+        """思考区正文左端点（解码坐标）：开标签之后（开标签在 prompt 内的
+        形态 B 为 0）。供 token 对齐按区间切片，剔除标签字符。"""
+        return self._open_len
+
+    def fed_len(self):
+        """已喂入文本总长度（解码坐标）：token 对齐的消费上界——生成线程
+        可能已把后续 token 写进 token_ids，但其文本 chunk 尚未被消费喂入
+        分离器（线程先于消费推进），越界即暂缓定性，保证 join(token_texts)
+        恒为 cum_text 前缀（契约 C3）。"""
+        return self._fed
 
     def feed(self, chunk):
         """喂入一段文本 → (思维链增量, 正文增量)。"""
@@ -184,7 +205,7 @@ class _ThinkSplitter:
         if self.state == "probe":
             self._pending += chunk
             if len(self._pending) < len(_THINK_OPEN) and _THINK_OPEN.startswith(self._pending):
-                return "", ""  # 仍可能是  simd 前缀：暂缓判定
+                return "", ""  # 仍可能是开标签前缀：暂缓判定
             if self._pending.startswith(_THINK_OPEN):
                 rest = self._pending[len(_THINK_OPEN):]
                 self.state, self._pending = "think", ""
@@ -206,8 +227,10 @@ class _ThinkSplitter:
             return out, ""
         reasoning = self._pending[:i]
         rest = self._pending[i + len(_THINK_CLOSE):]
-        self._content_start = len(_THINK_OPEN) + len(reasoning) + len(_THINK_CLOSE)
+        # 开标签在 prompt 内时它不占流内坐标，故计入 _open_len（此时为 0）
+        self._content_start = self._open_len + len(reasoning) + len(_THINK_CLOSE)
         self.state, self._pending = "content", ""
+        self.closed = True   # 思考区闭合：前端据此在 cot 块末尾补写闭标签
         return reasoning, rest
 
     def flush(self):
@@ -222,9 +245,85 @@ class _ThinkSplitter:
         return "", ""
 
 
+def _prompt_pending_think(prompt) -> bool:
+    """prompt 是否处于未闭合的思考区（Qwen3 系模板 enable_thinking=true）。
+
+    此时生成流首即思考正文、只含闭标签，分离器须以 assume_thinking=True
+    启动，否则思考内容会被当作正文、闭标签还会泄漏进正文。
+
+    全文扫描而非固定尾部窗口：续写场景下回灌的思维链可能有上千字符，
+    开标签会被挤出任何固定大小的窗口，导致误判为"不在思考区"。
+    """
+    if not isinstance(prompt, str) or not prompt:
+        return False
+    i = prompt.rfind(_THINK_OPEN)
+    if i < 0:
+        return False
+    return prompt.find(_THINK_CLOSE, i) < 0
+
+
+def _splice_pending_think(prompt: str, cot_prefix: str) -> str:
+    """把文档中的思维链作为思考区回灌，行为由 cot 块的闭合状态决定（所见即所得）。
+
+    插件端把 `<think>` 与 `<<arg_key:6124c78e>>` 直接写在 cot 注释块里，用户
+    可编辑：保留闭标签 → 思考已完成，模型直接给正文；删掉闭标签 → 思考被中断，
+    模型从断点继续思考（重新实测 Qwen3.5-4B：未闭合时模型会一直思考不闭合，
+    这正是"接续思考"的行为，用户可随时定稿或补闭标签结束）。
+
+    两种 cot 形态：
+    - 新格式（cot 以 `<think>` 开头）：自包含完整思考区，直接替换模板渲染的
+      思考区（模板可能渲染出未闭合的 `<think>` 或闭合的空块）。
+    - 旧格式（纯文本，历史文档）：按闭合回灌处理（补全标签），保证可读性。
+    """
+    if not cot_prefix:
+        return prompt
+    if not isinstance(prompt, str) or not prompt:
+        return cot_prefix if cot_prefix.strip().startswith(_THINK_OPEN) else (
+            _THINK_OPEN + "\n" + cot_prefix + "\n" + _THINK_CLOSE + "\n\n"
+        )
+    i = prompt.rfind(_THINK_OPEN)
+    if i < 0:
+        # 模板未渲染思考区标记：原样接在末尾
+        return prompt + "\n" + cot_prefix
+    j = prompt.find(_THINK_CLOSE, i)
+    rest = prompt[j + len(_THINK_CLOSE):] if j >= 0 else ""
+    if cot_prefix.strip().startswith(_THINK_OPEN):
+        # 新格式：cot 自带标签。提取正文并重建思考区，**保持模板渲染的
+        # "<think>\n" 结构**——若把 cot 的 <think> 原样替换进来（其后再接
+        # 正文而非换行），token 序列在 <think> 后即与上次生成的
+        # "<think>\n…" 前缀分叉（实测只匹配到模板部分 22/322），KV 缓存
+        # 复用失效 → 回灌的整段思维链全量 prefill，随长度线性变慢。
+        s = cot_prefix.strip()
+        body = s[len(_THINK_OPEN):]          # 去掉开标签
+        closed = False
+        ci = body.rfind(_THINK_CLOSE)
+        if ci >= 0:
+            body = body[:ci]
+            closed = True
+        body = body.strip("\n")              # 模板思考区自带 \n 分隔
+        if closed:
+            return prompt[:i] + _THINK_OPEN + "\n" + body + "\n" + _THINK_CLOSE + rest
+        return prompt[:i] + _THINK_OPEN + "\n" + body + rest
+    # 旧格式：纯文本 → 闭合回灌（模型稳定出正文）
+    return prompt[:i] + _THINK_OPEN + "\n" + cot_prefix + "\n" + _THINK_CLOSE + rest
+
+
 @dataclass
 class GenUpdate:
-    """一次流式生成的增量快照。"""
+    """一次流式生成的增量快照。
+
+    三后端（local/llamacpp/api）统一的行为契约（前端 web/editor.js 与
+    VSCode 插件 generation.ts 的着色对账都依赖，回归锚点见
+    tests/test_backend_contract.py）：
+    - final=True 的快照有且只有最后一个（自然结束/停止/出错后收尾）；
+    - token_texts 与 token_ppls、reasoning_token_texts 与
+      reasoning_token_ppls 一一等长；
+    - join(token_texts) 恒为 cum_text 的前缀，final 时相等（logprobs
+      不可用的后端/服务端则为空列表）；
+    - join(reasoning_token_texts) 恒为 reasoning_cum 的前缀，final 时相等，
+      且不含思考区标签字符（仅思考正文）；API 后端无 reasoning
+      logprobs → 恒为空（思维链不着色是已知的降级，非失配）。
+    """
 
     cum_text: str = ""                                   # 截至当前的累计生成文本（正文，不含思维链）
     reasoning_cum: str = ""                              # 截至当前的累计思维链（推理模型）
@@ -232,6 +331,7 @@ class GenUpdate:
     token_texts: list = field(default_factory=list)      # 与 ppl 对齐的文本片段（增量解码差分）
     reasoning_token_ppls: list = field(default_factory=list)  # 思考区 token 困惑度（本地后端）
     reasoning_token_texts: list = field(default_factory=list) # 与其对齐的文本片段
+    reasoning_closed: bool = False                       # 思考区是否已闭合（模型输出过闭标签）
     final: bool = False                                  # 是否为本次流式的最后一次更新
 
 
@@ -296,6 +396,22 @@ class LocalBackend:
     def loaded(self) -> bool:
         return self.model is not None
 
+    def unload(self):
+        """释放模型、KV 缓存并归还显存（切换后端时由服务端调用）。"""
+        self.model = None
+        self.tokenizer = None
+        self.model_name = ""
+        self._kv_cache = None
+        self._cache_ids = []
+        self.last_cache_info = ""
+        self.reasoning_seen = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001  torch 不可用时仅丢弃引用
+            pass
+
     def load(self, model_path: str):
         """加载本地路径或 HuggingFace hub 模型。CUDA -> fp16，CPU -> fp32。"""
         d = _local_deps()
@@ -315,13 +431,14 @@ class LocalBackend:
         self.reasoning_seen = False
 
     # -------------------------------------------------------------- 聊天模板
-    def apply_chat_template(self, messages, active_text, enable_thinking=None):
+    def apply_chat_template(self, messages, active_text, enable_thinking=None, cot_prefix=""):
         """messages → 模板化生成前缀文本（含 assistant 起始标记）+ 活动块续写头。
 
         提示词块映射为 user 指令、生成块为 assistant 回复，使 Instruct 模型
         正确区分"指令"与"正文"，避免把提示词当正文续写。
         enable_thinking：思考模式开关（仅模板含该变量时生效，如 Qwen3）；
         None=跟随模型默认。
+        cot_prefix：被中断的思维链（正文尚未开始时的续写头），拼进思考区。
         """
         kwargs = {}
         if enable_thinking is not None and "enable_thinking" in self._chat_template_text():
@@ -329,12 +446,12 @@ class LocalBackend:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
-        return prompt + (active_text or "")
+        return _splice_pending_think(prompt, cot_prefix) + (active_text or "")
 
     # ----------------------------------------------------------- prompt 构造
-    def build_chat_prompt(self, messages, active_text, enable_thinking=None):
+    def build_chat_prompt(self, messages, active_text, enable_thinking=None, cot_prefix=""):
         """chat 模式：本地后端 → 应用聊天模板后的平文本 str。"""
-        return self.apply_chat_template(messages, active_text, enable_thinking)
+        return self.apply_chat_template(messages, active_text, enable_thinking, cot_prefix)
 
     def build_flat_prompt(self, flat_text):
         """prefix/raw 模式：本地后端 → 原样平文本 str。"""
@@ -343,15 +460,69 @@ class LocalBackend:
     # -------------------------------------------------------------- 困惑度
     def compute_context_ppl(self, text: str) -> float:
         """上下文困惑度：一次前向传播 exp(mean CE)。提示词准确度指标。"""
-        if not self.loaded or not text.strip():
-            return float("nan")
+        return self.score_context(text)[0]
+
+    def score_context(self, context: str, tail_text: str = ""):
+        """上下文打分（单次前向）：整段困惑度 + 尾部文本逐 token 困惑度。
+
+        prefill 本就要前向整个上下文，故同一趟同时产出 prompt 困惑度与
+        尾部文本（活动块内手动编辑的部分）的逐 token ppl，前端据此为
+        编辑文本着色。返回 (ctx_ppl, tail_token_texts, tail_token_ppls)；
+        ctx_ppl 不可用时为 nan，尾部无法按 token 边界对齐时为空列表。
+        """
+        if not self.loaded or not context.strip():
+            return float("nan"), [], []
         torch = _require_torch()[0]
-        enc = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+        enc = self.tokenizer(context, return_tensors="pt").to(self.model.device)
         if enc.input_ids.shape[1] < 2:
-            return float("nan")
+            return float("nan"), [], []
         with torch.no_grad():
             out = self.model(**enc, labels=enc.input_ids)
-        return math.exp(min(out.loss.item(), 20.0))
+        ctx = math.exp(min(out.loss.item(), 20.0))
+        tail_t, tail_p = self._score_tail(
+            context, enc.input_ids[0].tolist(), out.logits, tail_text
+        )
+        return ctx, tail_t, tail_p
+
+    def _score_tail(self, context, ids, logits, tail_text):
+        """尾部文本逐 token 打分：logits[i-1] 预测 ids[i] 的 log-prob。
+
+        token 边界用「头部单独 tokenize 必须是全量 tokenize 的前缀」判定
+        （模板尾部与活动文本在 BPE 层合并的罕见情形下放弃打分）；
+        文本片段用增量解码差分法对齐（与 generate_stream 同语义）。
+        """
+        torch = _require_torch()[0]
+        if not tail_text or not context.endswith(tail_text):
+            return [], []
+        head_ids = self.tokenizer(
+            context[: len(context) - len(tail_text)], return_tensors=None
+        )["input_ids"]
+        start = len(head_ids)
+        if start < 1 or start >= len(ids) or ids[:start] != head_ids:
+            return [], []
+        # 分块 log_softmax 控制大词表长尾的瞬时显存峰值
+        lps: list = []
+        lo = start
+        while lo < len(ids):
+            hi = min(lo + 128, len(ids))
+            chunk = torch.log_softmax(logits[0, lo - 1: hi - 1].float(), dim=-1)
+            tgt = torch.tensor(ids[lo:hi], dtype=torch.long, device=chunk.device)
+            lps.extend(chunk.gather(1, tgt.unsqueeze(1)).squeeze(1).tolist())
+            lo = hi
+        texts, ppls, base_len = [], [], len(
+            self.tokenizer.decode(ids[:start], skip_special_tokens=True)
+        )
+        for i, lp in enumerate(lps, start=start):
+            prefix = self.tokenizer.decode(ids[: i + 1], skip_special_tokens=True)
+            piece = prefix[base_len:]
+            base_len = len(prefix)
+            if not piece:
+                continue
+            texts.append(piece)
+            ppls.append(math.exp(min(-lp, 20.0)))
+        if not texts or not tail_text.endswith("".join(texts)):
+            return [], []  # 对齐失配（尾部含特殊 token 等）→ 放弃
+        return texts, ppls
 
     # ---------------------------------------------------------------- 生成
     def stop(self):
@@ -392,21 +563,32 @@ class LocalBackend:
         ids = self.tokenizer(context, return_tensors=None)["input_ids"]
         if len(ids) < 2:
             self._kv_cache, self._cache_ids = None, []
+        # 混合线性注意力模型（Qwen3.5 gated deltanet 等，config.layer_types
+        # 标记 linear_attention / mamba* 层）在 transformers 5.x 须由 generate
+        # 按 config 自建专用缓存：手动构造/传入 DynamicCache 会在
+        # update_conv_state 处 IndexError（list index out of range），且无法
+        # 手动 prefill。此类模型禁用手动 KV 缓存（全量前向交由 generate）。
+        layer_types = getattr(self.model.config, "layer_types", None) or []
+        hybrid_linear = any(
+            isinstance(t, str) and ("linear" in t or "mamba" in t) for t in layer_types
+        )
+        if hybrid_linear:
+            self._kv_cache, self._cache_ids = None, []
         cache, k = self._kv_cache, 0
         if cache is not None:
             k = _common_prefix_len(self._cache_ids, ids)
             if k < _MIN_CACHE_REUSE:
                 cache, k = None, 0
-        if cache is None:
+        if cache is None and not hybrid_linear:
             cache = d["DynamicCache"]()
-        else:
+        elif cache is not None:
             if k >= len(ids):
                 # 缓存已覆盖整个 prompt（如立即重新生成同一上下文）：
                 # 回退 1 个 token 作为 generate 的种子，否则 generate 的
                 # cache_position 切片为空会 IndexError
                 k = len(ids) - 1
             cache.crop(k)
-        prefill_ids = ids[k:-1]  # 缓存未覆盖且非末位（末位作为 generate 种子）
+        prefill_ids = ids[k:-1] if cache is not None else []  # 末位作为 generate 种子
         if prefill_ids:
             dev = self.model.device
             try:
@@ -433,9 +615,12 @@ class LocalBackend:
         self.last_cache_info = (
             f"⚡KV缓存复用 {k}/{len(ids)} token"
             if k
+            else "KV缓存不可用（混合注意力模型）" if hybrid_linear
             else "KV缓存未命中"
         )
-        self._kv_cache, self._cache_ids = cache, ids[:-1]
+        self._kv_cache, self._cache_ids = (
+            (cache, ids[:-1]) if cache is not None else (None, [])
+        )
 
         enc_ids = torch.tensor([ids], dtype=torch.long, device=self.model.device)
         do_sample = bool(gen_params.get("do_sample", True))
@@ -444,11 +629,14 @@ class LocalBackend:
             do_sample=do_sample,
             repetition_penalty=float(gen_params.get("repetition_penalty", 1.1)),
             streamer=streamer,
-            past_key_values=cache,
             use_cache=True,
             logits_processor=d["LogitsProcessorList"]([proc]),
             stopping_criteria=d["StoppingCriteriaList"]([d["_StopOnEvent"](self._stop_event)]),
         )
+        # 混合注意力模型不传 past_key_values：由 generate 按 config 自建
+        # 专用缓存（传 DynamicCache 会 IndexError）
+        if cache is not None:
+            kwargs["past_key_values"] = cache
         if do_sample:
             kwargs.update(
                 temperature=float(gen_params.get("temperature", 0.8)),
@@ -477,28 +665,36 @@ class LocalBackend:
 
         # token-文本对齐（增量解码差分法）：逐 token decode 前缀取差分，
         # 片段与 ppl 一一对应，中文多字节字符跨 token 不乱码。
-        # 思维链（simd…skill）：思考区 token 的 ppl 与正文同源，思维链
-        # 也可以困惑度着色（r_aligned）。
+        # 思考区 token 的 ppl 与正文同源 → 思维链同样困惑度着色（r_aligned），
+        # 但标签字符不入序列（join(r_aligned) == reasoning_cum，见下）。
         aligned: list = []   # (text, ppl) 仅正文 token
-        r_aligned: list = [] # (text, ppl) 思考区 token（思维链困惑度着色）
+        r_aligned: list = [] # (text, ppl) 思考区正文 token（不含标签字符）
         aligned_len = 0
         seen = 0
         cum_text = ""
         reasoning_cum = ""
-        splitter = _ThinkSplitter()
+        # 模板已预置 <think> 时流首即思考正文，分离器需直接进入 think 态
+        splitter = _ThinkSplitter(assume_thinking=_prompt_pending_think(context))
 
         def _ppl_of(i):
             return math.exp(min(-proc.log_probs[i], 20.0))
 
         def _pull_new_tokens():
             nonlocal seen, aligned_len
-            # probe/think 阶段暂不消费 token（正文尚未开始）；进入正文后
-            # 统一对齐：思考区 token 归思维链 ppl（本地后端思考 token 的
-            # log-prob 与正文同源，思维链同样可以困惑度着色）、跨界 token
-            # 拆两段各归其位
-            if splitter.state != "content":
+            # probe 态标签未定，暂不消费；think/content 态按坐标区间切片：
+            #   思考区正文 [r0, r1) → r_aligned；正文 [head, ∞) → aligned；
+            #   开/闭标签字符两不收——join(r_aligned) 必须与 reasoning_cum
+            #   逐字相等（前端/插件按前缀覆盖对账，混入标签即整体失配 →
+            #   思维链不着色）。think 态 r1 = 已确认的思考正文右端（分离器
+            #   持回的闭标签候选尾部、流器空格启发式持回的尾词均不含），
+            #   越界的 token 暂缓消费、待定性后再对齐；思考未闭合被截断/
+            #   停止时由 finally 的 flush 兜底补齐（思维链仍完整着色）。
+            if splitter.state == "probe":
                 return
-            head = splitter.content_start()
+            r0 = splitter.reasoning_start()
+            r1 = r0 + len(reasoning_cum)
+            head = splitter.content_start()   # think 态 → None（正文未开始）
+            fed = splitter.fed_len()          # 分离器已见文本上界（线程竞态护栏）
             # log_probs 滞后一步：仅对齐已有 ppl 的 token
             n_avail = min(len(streamer.token_ids), len(proc.log_probs))
             for i in range(seen, n_avail):
@@ -506,19 +702,22 @@ class LocalBackend:
                     streamer.token_ids[: i + 1], skip_special_tokens=True
                 )
                 piece = prefix_text[aligned_len:]
-                aligned_len += len(piece)
-                seen = i + 1
+                end = aligned_len + len(piece)
+                if end > fed:
+                    # token 文本尚未经 chunk 喂入分离器（生成线程先于消费
+                    # 推进）→ 暂缓定性，否则对齐会超前于 cum_text、契约 C3 失守
+                    break
+                if head is None and end > r1:
+                    break  # 尾部尚未定性（可能是闭标签前缀）→ 暂缓消费
+                aligned_len, seen = end, i + 1
                 if not piece:
                     continue
-                start = aligned_len - len(piece)
-                if start >= head:
-                    aligned.append((piece, _ppl_of(i)))
-                elif aligned_len > head:
-                    # 跨界 token（含右标签）：前段入思维链、后段入正文
-                    r_aligned.append((piece[: head - start], _ppl_of(i)))
-                    aligned.append((piece[head - start:], _ppl_of(i)))
-                else:
-                    r_aligned.append((piece, _ppl_of(i)))
+                start = end - len(piece)
+                p0, p1 = max(r0, start), min(r1, end)
+                if p1 > p0:
+                    r_aligned.append((piece[p0 - start: p1 - start], _ppl_of(i)))
+                if head is not None and end > max(head, start):
+                    aligned.append((piece[max(head, start) - start:], _ppl_of(i)))
 
         try:
             for chunk in streamer:
@@ -536,6 +735,7 @@ class LocalBackend:
                     token_texts=[t for t, _ in aligned],
                     reasoning_token_ppls=[p for _, p in r_aligned],
                     reasoning_token_texts=[t for t, _ in r_aligned],
+                    reasoning_closed=splitter.closed,
                 )
         finally:
             # 收尾：join 线程；用保留的最后分布补齐尾部 token 的 log-prob
@@ -555,7 +755,7 @@ class LocalBackend:
                 proc.log_probs.append(proc.prev_logprobs[last_tok].item())
                 proc.prev_logprobs = None
             _pull_new_tokens()
-            # 流结束：未闭合 simd 尾部归位（probe→正文），再消费被扣住的 token
+            # 流结束：未闭合的思考区尾部归位（probe→正文），再消费被扣住的 token
             r, c = splitter.flush()
             reasoning_cum += r
             cum_text += c
@@ -567,6 +767,7 @@ class LocalBackend:
                 token_texts=[t for t, _ in aligned],
                 reasoning_token_ppls=[p for _, p in r_aligned],
                 reasoning_token_texts=[t for t, _ in r_aligned],
+                reasoning_closed=splitter.closed,
                 final=True,
             )
             # 保存 KV 缓存供下次复用：完整序列 = prompt + 生成。保守裁掉
@@ -682,6 +883,34 @@ class LlamaCppBackend:
         self.quant_info = self._quant_desc()
         self._stop_event = threading.Event()
         self.last_cache_info = ""
+        # llama-cpp-python 0.3.48 会把部分新架构（如 Qwen3.5）误判为 hybrid
+        # 模型，默认启用 KV checkpoint：每次 prompt（len>1）都把整个 KV 快照
+        # save_checkpoint（随上下文长度线性增长，300 token 时单次 ~0.5s），
+        # 首 token 延迟因此 ~1s。本项目不做投机采样/rollback，checkpoint 无用，
+        # 直接禁用（实测 1.09s → 0.09s）。Qwen3.5 是纯 transformer，无影响。
+        try:
+            _mgr = getattr(self._llm, "_hybrid_cache_mgr", None)
+            if _mgr is not None:
+                _mgr.max_checkpoints = 0
+        except Exception:  # noqa: BLE001
+            pass
+
+    def unload(self):
+        """释放 GGUF 模型与 KV 缓存，归还显存（切换后端时由服务端调用）。"""
+        llm, self._llm = self._llm, None
+        self.model_name = ""
+        self.quant_info = ""
+        self.context_size = 0
+        self.last_cache_info = ""
+        self.reasoning_seen = False
+        if llm is not None:
+            close = getattr(llm, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:  # noqa: BLE001  释放尽力而为，引用已断开
+                    pass
+            del llm  # 引用清零 → __del__ 释放 llama.cpp 上下文/权重
 
     # ------------------------------------------------------------ 底层访问
     def _n_ctx(self) -> int:
@@ -768,8 +997,13 @@ class LlamaCppBackend:
         except Exception:  # noqa: BLE001
             return ""
 
-    def _render_chat(self, messages) -> str:
-        """messages → GGUF 内嵌聊天模板渲染文本（含 assistant 起始标记）。"""
+    def _render_chat(self, messages, enable_thinking=None) -> str:
+        """messages → GGUF 内嵌聊天模板渲染文本（含 assistant 起始标记）。
+
+        enable_thinking 经 Jinja2ChatFormatter 的 **kwargs 注入模板上下文
+        （llama-cpp-python 0.3.x 会透传给 Jinja render）。Qwen3 系模板据此
+        决定是否预置未闭合的 <think>；模板无该变量时传参无副作用。
+        """
         llama_cpp = _require_llama_cpp()
         template = self._meta().get("tokenizer.chat_template", "")
         if not template:
@@ -783,25 +1017,37 @@ class LlamaCppBackend:
             eos_token=self._detok_text([self._llm.token_eos()]),
             bos_token=self._detok_text([self._llm.token_bos()]),
         )
+        kwargs = {}
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = bool(enable_thinking)
         try:
-            resp = formatter(messages=list(messages))            # 0.3.x：__call__
+            resp = formatter(messages=list(messages), **kwargs)  # 0.3.x：__call__
         except TypeError:
-            resp = formatter.format_messages(list(messages))     # 旧版方法名
+            # 旧版无 kwargs 透传 / 旧方法名：退化为不传开关
+            call = getattr(formatter, "format_messages", None) or formatter
+            try:
+                resp = call(list(messages), **kwargs)
+            except TypeError:
+                resp = call(list(messages))
         return resp.prompt
 
-    def apply_chat_template(self, messages, active_text, enable_thinking=None):
+    def apply_chat_template(self, messages, active_text, enable_thinking=None, cot_prefix=""):
         """messages → 模板化生成前缀文本（含 assistant 起始标记）+ 活动块续写头。
 
-        enable_thinking：llama-cpp-python 的 Jinja2ChatFormatter 不透传模板
-        变量，开关无法在此生效（思考与否取决于 GGUF 模板默认/服务端 jinja
-        配置）；保留参数以统一三后端 build_chat_prompt 签名。
+        enable_thinking：透传给 GGUF 内嵌 Jinja 模板。以前此开关在 llama.cpp
+        后端被丢弃，模板里 enable_thinking 未定义 → 走 else 分支渲染出空的
+        <think></think>（等于显式关闭思考），导致「思考模式 on」也不出思维链。
+        cot_prefix：被中断的思维链（正文尚未开始时的续写头），拼进思考区。
         """
-        return self._render_chat(messages) + (active_text or "")
+        return (
+            _splice_pending_think(self._render_chat(messages, enable_thinking), cot_prefix)
+            + (active_text or "")
+        )
 
     # ----------------------------------------------------------- prompt 构造
-    def build_chat_prompt(self, messages, active_text, enable_thinking=None):
+    def build_chat_prompt(self, messages, active_text, enable_thinking=None, cot_prefix=""):
         """chat 模式：llama.cpp 后端 → 应用聊天模板后的平文本 str。"""
-        return self.apply_chat_template(messages, active_text, enable_thinking)
+        return self.apply_chat_template(messages, active_text, enable_thinking, cot_prefix)
 
     def build_flat_prompt(self, flat_text):
         """prefix/raw 模式：llama.cpp 后端 → 原样平文本 str。"""
@@ -825,39 +1071,152 @@ class LlamaCppBackend:
 
     # -------------------------------------------------------------- 困惑度
     def compute_context_ppl(self, text: str) -> float:
-        """上下文困惑度：逐 token 前向打分 exp(mean CE)。提示词准确度指标。
+        """上下文困惑度：分块批量前向打分 exp(mean CE)。提示词准确度指标。"""
+        return self.score_context(text)[0]
 
-        与 llama.cpp 官方 perplexity 工具同思路：reset 后逐 token eval，
-        每步从 llama_get_logits 取完整分布，log_softmax 回填下一 token 的
-        log-prob；超长文本保留尾部（最新上下文）。打分后上下文即被评文本，
-        同 prompt 的下一次生成可命中 KV 前缀缓存。
+    def score_context(self, context: str, tail_text: str = ""):
+        """上下文打分（单趟 eval）：整段困惑度 + 尾部文本逐 token 困惑度。
+
+        与 llama.cpp 官方 perplexity 工具同思路：reset 后分块 eval，块内
+        逐位置从 llama_get_logits_ith 取完整分布，log_softmax 回填下一 token
+        的 log-prob；超长文本保留尾部（最新上下文）。批量 eval（单次喂整块，
+        GPU 矩阵乘满载）相比旧逐 token eval（每次单 token kernel，吞吐低
+        数量级）大幅提速 prefill。打分后上下文即被评文本，同 prompt 的下一次
+        生成可命中 KV 前缀缓存。内部 batch 接口不兼容时退化为逐 token eval
+        （数值一致，仅慢）。
+
+        tail_text（活动块手动编辑的文本，位于 context 末尾）在同一趟内取得
+        其逐 token ppl，前端据此为编辑文本着色。返回契约同 LocalBackend。
         """
-        if not self.loaded or not text.strip():
-            return float("nan")
+        if not self.loaded or not context.strip():
+            return float("nan"), [], []
         try:
             import numpy as np
         except ImportError:
-            return float("nan")
-        toks = self._tokenize(text)
+            return float("nan"), [], []
+        toks = self._tokenize(context)
         if len(toks) < 2:
-            return float("nan")
+            return float("nan"), [], []
         limit = self._n_ctx() - 2
         if len(toks) > limit:
             toks = toks[-limit:]
         try:
             self._llm.reset()
-            log_probs = []
-            for i in range(len(toks) - 1):
-                self._llm.eval([toks[i]])
-                logits = self._read_logits(np)
-                if logits is None:
-                    return float("nan")
+            log_probs = self._ppl_batched(toks, np)
+            if log_probs is None:
+                log_probs = self._ppl_one_by_one(toks, np)
+        except Exception:  # noqa: BLE001  eval 接口不兼容等 → 退化为不可用
+            return float("nan"), [], []
+        if not log_probs:
+            return float("nan"), [], []
+        ctx = math.exp(min(-sum(log_probs) / len(log_probs), 20.0))
+        return ctx, *self._score_tail(context, toks, log_probs, tail_text)
+
+    def _score_tail(self, context, toks, log_probs, tail_text):
+        """尾部文本逐 token 打分：log_probs[i-1] 为 toks[i] 的 log-prob。
+
+        token 边界用「头部单独 tokenize 必须是全量 tokenize 的前缀」判定；
+        文本片段用 detokenize 差分对齐（与 generate_stream 同语义）。
+        超长截断（保留尾部）后头部不再是前缀 → 放弃（罕见）。
+        """
+        if not tail_text or not context.endswith(tail_text):
+            return [], []
+        head_toks = self._tokenize(context[: len(context) - len(tail_text)])
+        start = len(head_toks)
+        if start < 1 or start >= len(toks) or toks[:start] != head_toks:
+            return [], []
+        texts, ppls, full = [], [], ""
+        for i in range(start, len(toks)):
+            new = self._llm.detokenize(
+                toks[start: i + 1], prev_tokens=toks[:start]
+            ).decode("utf-8", errors="ignore")
+            piece = new[len(full):]
+            full = new
+            if not piece:
+                continue
+            texts.append(piece)
+            # log_probs[j] 对应 toks[j+1]；i ≤ len(toks)-1 < len(log_probs)+1
+            ppls.append(math.exp(min(-log_probs[i - 1], 20.0)))
+        if not texts or not tail_text.endswith("".join(texts)):
+            return [], []  # 对齐失配（尾部含特殊 token 等）→ 放弃
+        return texts, ppls
+
+    def _ppl_one_by_one(self, toks, np):
+        """逐 token eval 打分（兼容回退路径）。"""
+        log_probs = []
+        for i in range(len(toks) - 1):
+            self._llm.eval([toks[i]])
+            logits = self._read_logits(np)
+            if logits is None:
+                return []
+            m = float(logits.max())
+            lse = m + math.log(float(np.exp(logits - m).sum()))
+            log_probs.append(float(logits[toks[i + 1]]) - lse)
+        return log_probs
+
+    def _ppl_batched(self, toks, np):
+        """分块批量 eval 打分（llama-cpp-python 内部 batch 接口）。
+
+        逐位置 logits 需在 batch 上显式置位（公共 eval() 只给末位产出
+        logits），故镜像 Llama.eval 的内部流程：_batch.add_sequence 全置
+        logits → _decode_eval_batch → llama_get_logits_ith 逐位置读取，
+        并同步 input_ids/n_tokens 台账保证后续 generate 前缀复用。
+        接口不兼容（版本差异）返回 None → 调用方回退逐 token 路径。
+        """
+        llama_cpp = _require_llama_cpp()
+        get_ith = getattr(llama_cpp, "llama_get_logits_ith", None)
+        llm = self._llm
+        if get_ith is None or not all(
+            hasattr(llm, a) for a in ("_batch", "_ctx", "input_ids", "n_tokens")
+        ):
+            return None
+        try:
+            decode = llm._decode_eval_batch
+        except AttributeError:
+            return None
+        n_vocab = self._n_vocab()
+        if n_vocab <= 0:
+            return None
+        # 块长上限 256：C 侧 logits 输出缓冲 = 块长×词表（Qwen 词表 15 万 ×
+        # 2048 块 ≈ 1.2GB，256 ≈ 150MB，够快也够省）
+        bs = max(1, min(256, int(getattr(llm, "n_batch", 256) or 256)))
+        log_probs = []
+        end = len(toks) - 1  # 末 token 无"下一 token"可打分，无需 eval
+        pos = 0
+        while pos < end:
+            chunk = toks[pos: min(pos + bs, end)]
+            n = len(chunk)
+            llm._batch.reset()
+            llm._batch.add_sequence(
+                chunk,
+                list(range(llm.n_tokens, llm.n_tokens + n)),
+                [0],
+                [True] * n,
+            )
+            for cleanup in ("clear_loras", "clear_cvec"):
+                fn = getattr(llm._ctx, cleanup, None)
+                if fn is not None:
+                    try:
+                        fn()
+                    except Exception:  # noqa: BLE001
+                        pass
+            got = int(decode(chunk, n))
+            if got <= 0:
+                return None
+            for j in range(got):
+                ptr = get_ith(llm.ctx, j)
+                if not ptr:
+                    return None  # 版本行为不符（未置位的 logits）→ 整体退化
+                logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,))
+                nxt = toks[pos + j + 1]
                 m = float(logits.max())
                 lse = m + math.log(float(np.exp(logits - m).sum()))
-                log_probs.append(float(logits[toks[i + 1]]) - lse)
-        except Exception:  # noqa: BLE001  eval 接口不兼容等 → 退化为不可用
-            return float("nan")
-        return math.exp(min(-sum(log_probs) / len(log_probs), 20.0))
+                log_probs.append(float(logits[nxt]) - lse)
+            # 与 Llama.eval 相同的台账同步（generate 前缀复用依赖）
+            llm.input_ids[pos: pos + got] = chunk[:got]
+            llm.n_tokens += got
+            pos += got
+        return log_probs
 
     # ---------------------------------------------------------------- 生成
     def stop(self):
@@ -908,13 +1267,42 @@ class LlamaCppBackend:
         max_tokens = max(1, min(max_tokens, n_ctx - len(toks) - 1))
         self.last_cache_info = self._cache_note(toks)
 
-        gen = self._llm.generate(
-            toks,
+        # llama-cpp-python 0.3.x 的 generate() 在前缀完全命中缓存长度
+        # （longest_token_prefix == n_tokens）时不会缩短 tokens：截断分支的条件是
+        # `longest_prefix < n_tokens`，等于时直接跳过 → 整个 prompt 被重新 eval
+        # 一遍，回灌长思维链时 prefill 明显变慢（实测 300 token 思维链首 token
+        # ~1.07s，尽管 KV 明明全部命中）。这里手动处理：完全命中时把 tokens
+        # 缩短到新增部分，并以 reset=False 续跑——n_tokens 保留，eval 从缓存
+        # 末尾继续，只 prefill 新增的闭标签等少量 token。
+        reuse_prefix = 0
+        llm = self._llm
+        if (
+            hasattr(llm, "longest_token_prefix")
+            and getattr(llm, "n_tokens", 0) > 0
+            and len(toks) > int(llm.n_tokens)
+        ):
+            try:
+                if llm.longest_token_prefix(llm._input_ids, toks) == int(llm.n_tokens):
+                    reuse_prefix = int(llm.n_tokens)
+            except Exception:  # noqa: BLE001
+                reuse_prefix = 0
+        if reuse_prefix:
+            toks = toks[reuse_prefix:]
+
+        gen_kwargs = dict(
             top_k=int(gen_params.get("top_k", 50)),
             top_p=float(gen_params.get("top_p", 0.95)),
             temp=float(gen_params.get("temperature", 0.8)) if do_sample else 0.0,
             repeat_penalty=float(gen_params.get("repetition_penalty", 1.1)),
         )
+        if reuse_prefix:
+            gen_kwargs["reset"] = False
+        try:
+            gen = self._llm.generate(toks, **gen_kwargs)
+        except TypeError:
+            # 老实现/替身不接受 reset 参数：退化为全量 prefill（正确性不变）
+            gen_kwargs.pop("reset", None)
+            gen = self._llm.generate(toks, **gen_kwargs)
 
         cum_text = ""        # 仅正文（思维链经 _ThinkSplitter 分离）
         reasoning_cum = ""
@@ -924,7 +1312,9 @@ class LlamaCppBackend:
         reasoning_token_texts: list = []
         reasoning_token_ppls: list = []
         completion_tokens: list = []
-        splitter = _ThinkSplitter()
+        # 模板已预置 <think> 时流首即思考正文，分离器需直接进入 think 态
+        splitter = _ThinkSplitter(assume_thinking=_prompt_pending_think(context))
+        last_r_ppl = None   # 最近一个思考区 token 的 ppl（flush 补尾时沿用）
         n_gen = 0
         try:
             for token in gen:
@@ -957,6 +1347,7 @@ class LlamaCppBackend:
                     self.reasoning_seen = True
                     reasoning_token_texts.append(r)
                     reasoning_token_ppls.append(ppl)
+                    last_r_ppl = ppl
                 if c:
                     token_texts.append(c)
                     token_ppls.append(ppl)
@@ -967,6 +1358,7 @@ class LlamaCppBackend:
                     token_texts=list(token_texts),
                     reasoning_token_ppls=list(reasoning_token_ppls),
                     reasoning_token_texts=list(reasoning_token_texts),
+                    reasoning_closed=splitter.closed,
                 )
                 n_gen += 1
                 if n_gen >= max_tokens:
@@ -978,15 +1370,23 @@ class LlamaCppBackend:
                     close()
                 except Exception:  # noqa: BLE001
                     pass
-            # 流结束：未闭合 simd 尾部归位
+            # 流结束：未闭合的思考区尾部归位
             r, c = splitter.flush()
             reasoning_cum += r
             cum_text += c
+            # flush 补回的是 think 态暂缓的闭标签候选尾部（最长 len(闭标签)-1）。
+            # 必须同步补进 token 序列：否则 join(reasoning_token_texts) 比
+            # reasoning_cum 短这几个字符，插件端对账失配 → 思维链不着色，
+            # 定稿冻结校验（join == cot 块内容）也会永远失败。
+            if r:
+                reasoning_token_texts.append(r)
+                reasoning_token_ppls.append(last_r_ppl)
         yield GenUpdate(
             cum_text=cum_text, reasoning_cum=reasoning_cum,
             token_ppls=token_ppls, token_texts=token_texts,
             reasoning_token_ppls=reasoning_token_ppls,
-            reasoning_token_texts=reasoning_token_texts, final=True,
+            reasoning_token_texts=reasoning_token_texts,
+            reasoning_closed=splitter.closed, final=True,
         )
 
 
@@ -1017,6 +1417,15 @@ class OpenAICompatBackend:
     @property
     def loaded(self) -> bool:
         return bool(self.model and self.base_url)
+
+    def unload(self):
+        """断开 API 会话（无本地资源，仅清空连接配置）。"""
+        self.stop()
+        self.base_url = ""
+        self.api_key = ""
+        self.model = ""
+        self.supports_logprobs = None
+        self.reasoning_seen = False
 
     def _headers(self):
         h = {"Content-Type": "application/json"}
@@ -1050,14 +1459,28 @@ class OpenAICompatBackend:
         # 404/405：部分网关不实现 /models，放行，生成时再验证
 
     # ----------------------------------------------------------- prompt 构造
-    def build_chat_prompt(self, messages, active_text, enable_thinking=None):
+    def build_chat_prompt(self, messages, active_text, enable_thinking=None, cot_prefix=""):
         """chat 模式：API 后端 → messages 列表。活动块文本作为末尾 assistant
         消息（prefill），模型以其为上文继续输出新内容。
         enable_thinking 由 generate_stream 落到请求参数（vLLM/SGLang 的
-        chat_template_kwargs），此处仅统一三后端签名。"""
+        chat_template_kwargs），此处仅统一三后端签名。
+        cot_prefix：活动单元的思维链 → 走 OpenAI 扩展字段 reasoning_content
+        （DeepSeek / vLLM / SGLang 约定），正文续写时一并在 assistant 消息
+        携带，保证续写上下文与首次生成一致。个别服务端不认该字段时，效果
+        退化为"不带思维链上文"，即与修复前一致，不会报错。"""
         msgs = [dict(m) for m in messages]
+        cot = (cot_prefix or "").strip()
         if (active_text or "").strip():
-            msgs.append({"role": "assistant", "content": active_text})
+            a = {"role": "assistant", "content": active_text}
+            if cot:
+                a["reasoning_content"] = cot
+            msgs.append(a)
+        elif cot:
+            msgs.append({
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": cot,
+            })
         return msgs
 
     def build_flat_prompt(self, flat_text):
@@ -1184,6 +1607,8 @@ class OpenAICompatBackend:
                     reasoning_cum=reasoning_cum,
                     token_ppls=list(token_ppls),
                     token_texts=list(token_texts),
+                    # API 服务端的 reasoning_content 是协议级字段，天然闭合
+                    reasoning_closed=bool(reasoning_cum),
                 )
         except (ValueError, requests.RequestException):
             # stop() 关闭连接导致迭代异常 → 视为正常停止
@@ -1199,6 +1624,7 @@ class OpenAICompatBackend:
                 self.supports_logprobs = False  # 200 但从未返回 logprobs 数据
             final_snapshot = GenUpdate(
                 cum_text=cum_text, reasoning_cum=reasoning_cum,
-                token_ppls=token_ppls, token_texts=token_texts, final=True,
+                token_ppls=token_ppls, token_texts=token_texts,
+                reasoning_closed=bool(reasoning_cum), final=True,
             )
         yield final_snapshot

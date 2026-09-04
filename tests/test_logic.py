@@ -78,14 +78,15 @@ assert bc == cot_blocks and ac == "秋风起了。", (bc, ac)
 class _FlatBackend:
     kind = "test"
 
-    def build_chat_prompt(self, msgs, active):
-        return ("chat", msgs, active)
+    def build_chat_prompt(self, msgs, active, enable_thinking=None, cot_prefix=""):
+        return ("chat", msgs, active, cot_prefix)
 
     def build_flat_prompt(self, flat):
         return ("flat", flat)
 
 
 # cot 不进上下文（推理模型会自行重新思考）
+_O, _C = "<" + "thi" + "nk>", "</" + "thi" + "nk>"
 p = core.build_prompt(
     [{"type": "cot", "content": "SECRET_COT"},
      {"type": "prompt", "content": "写散文"}],
@@ -98,7 +99,51 @@ p2 = core.build_prompt(
      {"type": "generate", "content": "秋。"}],
     "续写", "", "prefix", _FlatBackend(),
 )
-assert "SECRET_COT" not in str(p2), p2
+# 定稿后续写：思考属本轮（generate 不断链）→ 仍作为带标签思考区回灌，
+# 但绝不作为普通块内容进上下文
+assert _O + "\nSECRET_COT\n" + _C in p2[1], p2
+assert "正文】\nSECRET_COT" not in p2[1], p2
+# 中断续写：正文尚未开始时，紧邻活动单元的 cot 应作为续写头回灌，
+# 否则再次生成会让模型从零重想一遍（表现为重复输出思考开头）
+p3 = core.build_prompt(
+    [{"type": "prompt", "content": "写散文"},
+     {"type": "cot", "content": "已想了一半"}],
+    "", "", "chat", _FlatBackend(),
+)
+# 新契约：cot_prefix 恒为带标签的思考区（closed 属性/旧格式标签推导闭合态，
+# 纯文本历史块按已闭合回灌），backend _splice_pending_think 负责替换模板思考区
+assert p3[3] == _O + "\n已想了一半\n" + _C, p3  # cot_prefix 回灌（闭合包装）
+assert "已想了一半" not in str(p3[1]), p3   # 但不作为普通块进 messages
+# 正文已开始 → 仍回灌：活动单元的思考区与正文同属当前 assistant 回复，
+# 续写上下文必须与首次生成一致（否则困惑度着色漂移、KV 缓存整体失效）
+p4 = core.build_prompt(
+    [{"type": "prompt", "content": "写散文"},
+     {"type": "cot", "content": "已想完"}],
+    "已有正文", "", "chat", _FlatBackend(),
+)
+assert p4[3] == _O + "\n已想完\n" + _C, p4
+# 未闭合 + 正文已开始：按未闭合回灌（所见即所得，模型从断点继续思考）
+p4o = core.build_prompt(
+    [{"type": "prompt", "content": "写散文"},
+     {"type": "cot", "content": "想了一半", "closed": False}],
+    "已有正文", "", "chat", _FlatBackend(),
+)
+assert p4o[3] == _O + "\n想了一半", p4o
+# raw 模式：思考区在活动正文之前（顺序）
+p6 = core.build_prompt(
+    [{"type": "prompt", "content": "写散文"},
+     {"type": "cot", "content": "思路"}],
+    "已有正文", "", "raw", _FlatBackend(),
+)
+flat = p6[1]
+assert flat.index("思路") < flat.index("已有正文") and "写散文" in flat, flat
+# cot 与活动单元之间隔着 prompt → 不是本轮的思考，不回灌
+p5 = core.build_prompt(
+    [{"type": "cot", "content": "旧思考"},
+     {"type": "prompt", "content": "换个题目"}],
+    "", "", "chat", _FlatBackend(),
+)
+assert p5[3] == "", p5
 print("[1] serialize/parse roundtrip OK")
 
 # 2. 技能扫描 + frontmatter + 上下文拼接
@@ -141,5 +186,17 @@ ctx = core.build_flat_context(
 )
 assert ctx == "SKL\n\nA\n\nB\n\nC", ctx
 print("[5] build_flat_context OK")
+
+# 6. 着色对账 reconcile_active_ppl：返回值必须覆盖整个 base（不变量）
+# 完全覆盖 → 原样返回
+assert core.reconcile_active_ppl(["秋", "风"], [1.2, 3.4], "秋风") == (["秋", "风"], [1.2, 3.4])
+# 覆盖是 base 严格前缀（末尾追加文本）→ 补灰段（此前不补 → 与后续段
+# 拼接出现字符空洞，生成时整块着色消失）
+assert core.reconcile_active_ppl(["秋"], [1.2], "秋风起") == (["秋", "风起"], [1.2, None])
+# 中点编辑 → 公共前缀内完整 token 保留，其后合并为灰段
+assert core.reconcile_active_ppl(["秋风", "起了"], [1.2, 3.4], "秋风来了") == (["秋风", "来了"], [1.2, None])
+# 空段 → 空
+assert core.reconcile_active_ppl([], [], "秋风") == ([], [])
+print("[6] reconcile_active_ppl coverage OK")
 
 print("ALL LOGIC TESTS PASSED")

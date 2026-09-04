@@ -1,6 +1,6 @@
 // 编辑器装饰：块背景着色、困惑度热力图、锁定灰显。TS 移植 core.ppl_rgb。
 import * as vscode from "vscode";
-import { ParsedDoc } from "./docmodel";
+import { cotBody, ParsedDoc } from "./docmodel";
 import { DocState } from "./state";
 
 const LOG_PPL_MAX = Math.log(200);
@@ -85,6 +85,16 @@ export class Decorator {
     startOffset: number,
     out: Map<vscode.TextEditorDecorationType, vscode.Range[]>
   ): void {
+    // 块内自适应困惑度色阶：真实 ppl 往往集中在 1~2（模型对思考内容也很确定），
+    // 若用全局 log 色阶（1→200）会被全部压进最底端一两个桶，视觉上"一个色"、
+    // 还显得困惑度"不更新"。这里以块内最大 ppl 为红端（下限 2），让思维链
+    // 也能按相对困惑度拉开绿→黄→红的层次。
+    let maxPpl = 1;
+    for (const p of tokenPpls) {
+      if (p !== null && p !== undefined && p > maxPpl) maxPpl = p;
+    }
+    const logHi = Math.log(Math.max(2, maxPpl));
+
     let off = startOffset;
     for (let i = 0; i < tokenTexts.length; i++) {
       const t = tokenTexts[i];
@@ -92,8 +102,17 @@ export class Decorator {
       const end = off + t.length;
       const range = new vscode.Range(doc.positionAt(off), doc.positionAt(end));
       const p = tokenPpls[i];
-      const type =
-        p === null || p === undefined ? this.grayType : this.heatType(bucketColor(p));
+      let type: vscode.TextEditorDecorationType;
+      if (p === null || p === undefined) {
+        type = this.grayType;
+      } else {
+        const tt = Math.min(1, Math.max(0, Math.log(Math.max(p, 1.0001)) / logHi));
+        const idx = Math.min(HEAT_BUCKETS - 1, Math.floor(tt * HEAT_BUCKETS));
+        const midT = (idx + 0.5) / HEAT_BUCKETS;
+        const pplAt = Math.exp(midT * logHi);
+        const [r, g, b] = pplRgb(pplAt);
+        type = this.heatType(`rgba(${r},${g},${b},0.45)`);
+      }
       let arr = out.get(type);
       if (!arr) {
         arr = [];
@@ -133,14 +152,17 @@ export class Decorator {
       } else if (blk.type === "cot") {
         cots.push(range);
         // 思维链困惑度着色：活动块用 activeCotPpl，定稿块查冻结数据，
-        // 无数据（API 后端/外部加载）保持轻背景不着色
+        // 无数据（API 后端/外部加载）保持轻背景不着色。
+        // cot 自包含 <think>/闭标签，着色起点要跳过标签前缀（按纯思考文本对齐）
         if (blk === activeCot) {
           if (state.activeCotPpl.token_texts.length) {
+            const body = cotBody(blk.content);
+            const startOff = blk.contentStart + (blk.content.length - body.length);
             this.tokenSegs(
               doc,
               state.activeCotPpl.token_texts,
               state.activeCotPpl.token_ppls,
-              blk.contentStart,
+              startOff,
               heat
             );
           }
@@ -149,9 +171,11 @@ export class Decorator {
           const segOk =
             fin &&
             fin.seg.token_texts.length &&
-            "".concat(...fin.seg.token_texts) === blk.content;
+            "".concat(...fin.seg.token_texts) === cotBody(blk.content);
           if (segOk) {
-            this.tokenSegs(doc, fin!.seg.token_texts, fin!.seg.token_ppls, blk.contentStart, heat);
+            const body = cotBody(blk.content);
+            const startOff = blk.contentStart + (blk.content.length - body.length);
+            this.tokenSegs(doc, fin!.seg.token_texts, fin!.seg.token_ppls, startOff, heat);
           }
         }
       } else {

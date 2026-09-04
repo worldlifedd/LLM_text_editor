@@ -1,5 +1,6 @@
 # 临时 Mock OpenAI 兼容服务：验证 server.py 的 API 后端 generate SSE 链路。
-# 监听 127.0.0.1:8999/v1/chat/completions，流式返回若干 chunk（含 logprobs）。
+# 监听 127.0.0.1:8998/v1/chat/completions，流式返回若干 chunk（含 logprobs，不含思维链）。
+# 需要验证思维链（reasoning_content）链路时改用 tests/mock_reasoning_openai.py。
 import json
 import os
 import sys

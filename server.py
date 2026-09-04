@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""生成式文本编辑器 — 无头 REST/SSE 服务（供 VSCode 插件等前端使用）。
+"""生成式文本编辑器 — 无头 REST/SSE 服务 + Web 块编辑器托管。
 
 复用 backend.py（本地 transformers / llama.cpp GGUF / OpenAI 兼容三后端）与
 core.py（文档序列化、上下文组装、困惑度聚合），默认监听 127.0.0.1:8907。
+浏览器打开 http://127.0.0.1:8907/ 即为块编辑器前端（web/，纯 vanilla JS）。
 
 端点：
 - GET  /api/status   {kind, loaded, loading, message, generating}
@@ -11,29 +12,49 @@ core.py（文档序列化、上下文组装、困惑度聚合），默认监听 
                      → 立即返回 {accepted:true}，实际加载在后台线程，结果经
                        /api/status 的 loading/message 反映（轮询）
 - POST /api/generate {blocks, active_text, skills, params, context_mode}
-                     → SSE 流：ctx_ppl / update* / error
+                     → SSE 流：ctx_ppl / prefill_ppl / update* / error
 - POST /api/stop     请求停止当前生成
-- GET  /api/skills   [{name, description}]
+- GET  /api/skills   [{name, description, instructions}]
+- 文档 CRUD（JSON 块数组，存 saves/*.json）：
+  GET/POST /api/docs、GET/DELETE /api/docs/{id}、
+  POST /api/docs/import_md（旧 Markdown 转 块）、GET /api/docs/{id}/export_md
 """
 import argparse
+import datetime
 import json
 import os
+import re
 import sys
 import threading
+import traceback
+import uuid
+from typing import Optional
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend import LlamaCppBackend, LocalBackend, OpenAICompatBackend
-from core import build_prompt
+from core import (
+    _THINK_CLOSE,
+    _THINK_OPEN,
+    build_prompt,
+    normalize_cot,
+    parse_doc,
+    serialize_doc,
+)
 from skills import scan_skills, skills_to_context
 
 DEFAULT_HOST, DEFAULT_PORT = "127.0.0.1", 8907
+SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saves")
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 app = FastAPI(title="Generative Text Editor Server")
 
-# 单用户本地应用：三种后端常驻（切换不卸载已加载模型），按当前模式取用
+# 三种后端常驻复用（同一时刻仅一个为活动后端）；切换加载时释放其余
+# 已加载后端的模型（llama.cpp / transformers 显存即时归还），活动后端
+# 重载同模式时旧模型在替换时随之释放
 _BACKENDS = {
     "local": LocalBackend(),
     "llamacpp": LlamaCppBackend(),
@@ -70,7 +91,7 @@ class GenParams(BaseModel):
     repetition_penalty: float = 1.1
     # 思考模式（推理模型）：None=模型默认；False=关闭（Qwen3 模板 /
     # vLLM chat_template_kwargs）；True 显式开启
-    enable_thinking: bool | None = None
+    enable_thinking: Optional[bool] = None
 
 
 class GenerateRequest(BaseModel):
@@ -123,6 +144,16 @@ def _load_worker(mode: str, req: LoadRequest):
     """后台加载线程：完成后把结果写入 _LOADING（status 轮询展示）。"""
     backend = _BACKENDS.get(mode) or _BACKENDS["local"]
     try:
+        # 切换后端：先释放其他已加载后端的模型显存/内存，再加载新后端；
+        # 生成进行中不得卸载（卸载正在生成的模型会导致硬崩溃）
+        if _GEN_LOCK.locked():
+            raise RuntimeError("生成进行中，请先停止生成再切换后端")
+        for kind, b in _BACKENDS.items():
+            if kind != mode and b.loaded:
+                try:
+                    b.unload()
+                except Exception:  # noqa: BLE001  释放尽力而为，不阻断加载
+                    traceback.print_exc()
         if mode == "api":
             _LOADING["message"] = f"⏳ 正在连接 API：{req.base_url} …"
             backend.load(req.base_url, req.api_key, req.model)
@@ -149,6 +180,7 @@ def _load_worker(mode: str, req: LoadRequest):
             else f"✅ 已加载：{backend.model_name}｜设备：{backend.device}"
         )
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()  # 命令行留全堆栈，便于调试
         _LOADING["message"] = f"❌ 加载失败：{e}"
     finally:
         _LOADING["running"] = False
@@ -184,6 +216,7 @@ def generate(req: GenerateRequest):
         if not prompt or (isinstance(prompt, str) and not prompt.strip()):
             return JSONResponse({"error": "文档为空：请先添加提示词块并输入内容"}, status_code=400)
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()  # 命令行留全堆栈，便于调试
         return JSONResponse({"error": f"上下文构造失败：{e}"}, status_code=400)
 
     if not _GEN_LOCK.acquire(blocking=False):
@@ -202,15 +235,26 @@ def generate(req: GenerateRequest):
 
     def _stream():
         try:
-            # 上下文困惑度：本地 transformers / llama.cpp 模式可用（API 不可用）
+            # 上下文打分：本地 transformers / llama.cpp 模式可用（API 不可用）。
+            # score_context 在同一次前向里顺带产出活动块文本（含手动编辑
+            # 部分）的逐 token ppl → prefill_ppl 事件，前端据此为编辑文本着色
             if backend.kind in ("local", "llamacpp"):
+                ctx, prefill_t, prefill_p = None, [], []
                 try:
-                    ctx = backend.compute_context_ppl(prompt)
+                    if hasattr(backend, "score_context"):
+                        ctx, prefill_t, prefill_p = backend.score_context(prompt, active)
+                    else:
+                        ctx = backend.compute_context_ppl(prompt)
                     ctx = round(ctx, 2) if ctx == ctx else None
                 except Exception:  # noqa: BLE001
-                    ctx = None
+                    ctx, prefill_t, prefill_p = None, [], []
                 if ctx is not None:
                     yield _sse_event("ctx_ppl", {"ppl": ctx})
+                if prefill_t:
+                    yield _sse_event("prefill_ppl", {
+                        "token_texts": prefill_t,
+                        "token_ppls": prefill_p,
+                    })
 
             for upd in backend.generate_stream(prompt, **gen_kwargs):
                 cache_note = getattr(backend, "last_cache_info", "")
@@ -222,10 +266,14 @@ def generate(req: GenerateRequest):
                     # 思维链困惑度（本地/llama.cpp；API 无 reasoning logprobs）
                     "reasoning_token_texts": upd.reasoning_token_texts,
                     "reasoning_token_ppls": upd.reasoning_token_ppls,
+                    # 思考区是否闭合（模型输出过闭标签）：插件端据此在 cot 块
+                    # 末尾补写闭标签；未闭合则保持"续写思考"状态（所见即所得）
+                    "reasoning_closed": upd.reasoning_closed,
                     "final": upd.final,
                     "cache_info": cache_note if backend.kind in ("local", "llamacpp") else "",
                 })
         except Exception as e:  # noqa: BLE001
+            traceback.print_exc()  # 命令行留全堆栈，便于调试
             yield _sse_event("error", {"error": str(e)})
         finally:
             _GEN_LOCK.release()
@@ -249,6 +297,188 @@ def skills():
         {"name": s.name, "description": s.description, "instructions": s.instructions}
         for s in scan_skills()
     ]
+
+
+# ==================================================================== 文档 CRUD
+# JSON 块数组持久化（saves/*.json）。块边界是前端 UI 元素而非文本标记，
+# 服务端只存取结构化块；Markdown 仅作导入/导出交换格式。
+
+_BLOCK_TYPES = {"prompt", "system", "cot", "generate"}
+_DOC_ID_RE = re.compile(r"[0-9a-zA-Z_-]{1,64}")
+
+
+class DocBlock(BaseModel):
+    type: str
+    content: str = ""
+    ppl: Optional[dict] = None  # {token_texts: [...], token_ppls: [...]}
+    closed: Optional[bool] = None  # cot 专用：思考是否已结束（新格式；旧格式由标签推导）
+
+
+class SaveDocRequest(BaseModel):
+    id: str = ""
+    title: str = "未命名文档"
+    blocks: list[DocBlock] = Field(default_factory=list)
+
+
+class ImportMdRequest(BaseModel):
+    text: str
+    title: str = "导入的文档"
+
+
+def _sanitize_blocks(blocks: list[DocBlock]) -> list[dict]:
+    """校验并规整块列表；末块非 generate 时补空活动块（文档不变式）。
+
+    cot 块归一化为新格式：content=纯思考正文（标签剥离），closed 属性
+    显式表达"是否已结束思考"（旧格式由内容里的标签推导）。
+    """
+    out = []
+    for b in blocks or []:
+        if b.type not in _BLOCK_TYPES:
+            raise ValueError(f"未知块类型：{b.type}")
+        ppl = None
+        if isinstance(b.ppl, dict) and isinstance(b.ppl.get("token_texts"), list) \
+                and isinstance(b.ppl.get("token_ppls"), list):
+            ppl = {
+                "token_texts": b.ppl["token_texts"],
+                "token_ppls": b.ppl["token_ppls"],
+            }
+        item = {"type": b.type, "content": b.content.strip(), "ppl": ppl}
+        if b.type == "cot":
+            body, closed = normalize_cot(
+                {"content": b.content, "closed": b.closed}
+            )
+            item["content"] = body
+            item["closed"] = closed
+        out.append(item)
+    if not out or out[-1]["type"] != "generate":
+        out.append({"type": "generate", "content": "", "ppl": None})
+    return out
+
+
+def _doc_path(doc_id: str) -> Optional[str]:
+    if not _DOC_ID_RE.fullmatch(doc_id or ""):
+        return None
+    return os.path.join(SAVE_DIR, f"{doc_id}.json")
+
+
+def _write_doc(doc_id: str, title: str, blocks: list[dict]) -> None:
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    doc = {
+        "id": doc_id,
+        "title": title,
+        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "blocks": blocks,
+    }
+    with open(_doc_path(doc_id), "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+
+
+def _read_doc(doc_id: str) -> Optional[dict]:
+    path = _doc_path(doc_id)
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@app.get("/api/docs")
+def list_docs():
+    """文档列表（按更新时间倒序）。"""
+    docs = []
+    if os.path.isdir(SAVE_DIR):
+        for name in os.listdir(SAVE_DIR):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(SAVE_DIR, name), "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+                docs.append({
+                    "id": doc.get("id") or name[:-5],
+                    "title": doc.get("title") or "未命名文档",
+                    "updated_at": doc.get("updated_at") or "",
+                })
+            except (OSError, ValueError):
+                continue  # 跳过损坏的文档文件
+    docs.sort(key=lambda d: d["updated_at"], reverse=True)
+    return docs
+
+
+@app.post("/api/docs")
+def save_doc(req: SaveDocRequest):
+    try:
+        blocks = _sanitize_blocks(req.blocks)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    doc_id = req.id if (_DOC_ID_RE.fullmatch(req.id or "") and _doc_path(req.id)) \
+        else uuid.uuid4().hex[:12]
+    _write_doc(doc_id, req.title.strip() or "未命名文档", blocks)
+    return {"id": doc_id}
+
+
+@app.get("/api/docs/{doc_id}")
+def get_doc(doc_id: str):
+    doc = _read_doc(doc_id)
+    if doc is None:
+        return JSONResponse({"error": "文档不存在"}, status_code=404)
+    return doc
+
+
+@app.delete("/api/docs/{doc_id}")
+def delete_doc(doc_id: str):
+    path = _doc_path(doc_id)
+    if not path or not os.path.isfile(path):
+        return JSONResponse({"error": "文档不存在"}, status_code=404)
+    os.remove(path)
+    return {"deleted": True}
+
+
+@app.post("/api/docs/import_md")
+def import_md(req: ImportMdRequest):
+    """旧 Markdown 注释块格式 → JSON 块文档（一次性按需迁移）。"""
+    blocks, active = parse_doc(req.text or "")
+    if active or not blocks:
+        blocks = blocks + [{"type": "generate", "content": active, "ppl": None}]
+    blocks = _sanitize_blocks([DocBlock(**b) for b in blocks])
+    doc_id = uuid.uuid4().hex[:12]
+    title = (req.title or "").strip() or "导入的文档"
+    _write_doc(doc_id, title, blocks)
+    return {"id": doc_id, "title": title, "blocks": blocks}
+
+
+@app.get("/api/docs/{doc_id}/export_md")
+def export_md(doc_id: str):
+    """JSON 块文档 → Markdown（core.serialize_doc，与旧格式互通）。"""
+    doc = _read_doc(doc_id)
+    if doc is None:
+        return JSONResponse({"error": "文档不存在"}, status_code=404)
+    blocks = _sanitize_blocks([DocBlock(**b) for b in doc.get("blocks", [])])
+    active = blocks.pop()["content"]  # 末块 = 活动生成单元
+    # cot 块补回标签（md 交换格式以标签承载"是否已结束思考"，与旧格式互通）
+    for b in blocks:
+        if b["type"] == "cot":
+            b["content"] = _THINK_OPEN + "\n" + b["content"] + (
+                "\n" + _THINK_CLOSE if b.get("closed") else ""
+            )
+    text = serialize_doc(
+        [{"type": b["type"], "content": b["content"]} for b in blocks], active
+    )
+    return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
+
+
+# 静态托管 Web 块编辑器（挂在最后，不遮挡 /api/* 路由）
+# no-cache：ES module 会被浏览器启发式缓存，改动后旧 JS 不刷新（依赖
+# ETag 重验证，未变时仍为 304，开销可忽略）
+if os.path.isdir(WEB_DIR):
+    _static = StaticFiles(directory=WEB_DIR, html=True)
+
+    @app.middleware("http")
+    async def _static_no_cache(request, call_next):
+        resp = await call_next(request)
+        if not request.url.path.startswith("/api"):
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    app.mount("/", _static, name="web")
 
 
 def main():

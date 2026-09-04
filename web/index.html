@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>生成式文本编辑器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="topbar">
+  <input id="docTitle" type="text" value="未命名文档" title="文档标题">
+  <span id="dirtyDot" title="有未保存修改" hidden>●</span>
+  <span class="spacer"></span>
+  <button id="btnGenerate" class="primary" type="button">▶ 生成 (Ctrl+Enter)</button>
+  <button id="btnFinalize" type="button" title="冻结当前生成块并开启新块">定稿 (F2)</button>
+  <button id="btnSave" type="button">保存 (Ctrl+S)</button>
+  <button id="btnNew" type="button">新建</button>
+  <button id="btnImport" type="button" title="导入旧格式 Markdown 文档">导入MD</button>
+  <button id="btnExport" type="button" title="导出为 Markdown">导出MD</button>
+  <button id="btnPreview" type="button" title="核对所见即所发">LLM视角</button>
+  <span id="genStatus"></span>
+</header>
+
+<div id="layout">
+  <aside id="sidebar">
+    <section class="panel">
+      <h3>📄 文档</h3>
+      <ul id="docList"></ul>
+    </section>
+
+    <section class="panel">
+      <h3>🔌 后端</h3>
+      <div class="row"><label>模式</label>
+        <select id="mode">
+          <option value="local">本地模型（transformers）</option>
+          <option value="llamacpp">llama.cpp（GGUF 量化）</option>
+          <option value="api">OpenAI 兼容 API</option>
+        </select>
+      </div>
+      <div class="row" id="localRow"><label>模型路径/ID</label>
+        <input type="text" id="modelPath" value="Qwen/Qwen3.5-2B"></div>
+      <div class="row" id="llamaRow" hidden><label>GGUF 路径</label>
+        <input type="text" id="llamaPath" value="unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf"></div>
+      <div class="row" id="llamaGpuRow" hidden><label>GPU 层数</label>
+        <input type="number" id="nGpuLayers" value="-1" title="-1=全部，0=纯 CPU"></div>
+      <div class="row" id="llamaCtxRow" hidden><label>上下文</label>
+        <input type="number" id="nCtx" value="4096"></div>
+      <div class="row" id="apiBaseUrlRow" hidden><label>Base URL</label>
+        <input type="text" id="baseUrl" placeholder="https://…/v1"></div>
+      <div class="row" id="apiKeyRow" hidden><label>API Key</label>
+        <input type="password" id="apiKey"></div>
+      <div class="row" id="apiModelRow" hidden><label>模型名</label>
+        <input type="text" id="apiModel"></div>
+      <button id="btnLoad" type="button">加载 / 连接</button>
+      <div id="statusLine" class="hint">未连接</div>
+    </section>
+
+    <section class="panel">
+      <h3>⚙ 生成参数</h3>
+      <div class="row"><label>上下文模式</label>
+        <select id="ctxMode">
+          <option value="chat">chat（角色消息）</option>
+          <option value="prefix">prefix（指令前缀）</option>
+          <option value="raw">raw（裸续写）</option>
+        </select>
+      </div>
+      <div class="row"><label>思考模式</label>
+        <select id="paramThink">
+          <option value="">模型默认</option>
+          <option value="on">开启</option>
+          <option value="off">关闭</option>
+        </select>
+      </div>
+      <div class="row"><label>最大新 token</label>
+        <input type="number" id="paramMax" value="256"></div>
+      <div class="row"><label>温度</label>
+        <input type="number" id="paramTemp" value="0.8" step="0.05"></div>
+      <div class="row"><label>Top-P</label>
+        <input type="number" id="paramTopP" value="0.95" step="0.05"></div>
+      <div class="row"><label>Top-K</label>
+        <input type="number" id="paramTopK" value="50"></div>
+      <div class="row"><label>重复惩罚</label>
+        <input type="number" id="paramRp" value="1.1" step="0.05"></div>
+      <div class="row"><label>采样</label>
+        <input type="checkbox" id="paramSample" checked></div>
+    </section>
+
+    <section class="panel">
+      <h3>🧩 技能库</h3>
+      <ul id="skillList" class="skill-list"></ul>
+      <button id="btnRefreshSkills" class="secondary" type="button">刷新技能库</button>
+    </section>
+
+    <section class="panel">
+      <h3>🌡 困惑度</h3>
+      <div class="metric">上下文 ppl：<b id="ctxPplVal">—</b></div>
+      <div class="metric">全文平均 ppl：<b id="avgPplVal">—</b></div>
+      <div id="cacheInfo" class="hint"></div>
+      <div class="legend">
+        <span style="background:rgba(134,226,148,0.45)">&nbsp;ppl≈1&nbsp;</span>
+        <span style="background:rgba(255,226,130,0.45)">&nbsp;ppl≈20&nbsp;</span>
+        <span style="background:rgba(255,118,108,0.45)">&nbsp;ppl≥200&nbsp;</span>
+        <span style="background:rgba(160,160,160,0.18)">&nbsp;灰=手动编辑&nbsp;</span>
+      </div>
+    </section>
+  </aside>
+
+  <main id="main">
+    <div id="editor"></div>
+    <footer id="bottombar">
+      <span class="hint">块间 <b>+</b> 插入块｜徽标点击切换 指令↔正文 / 折叠 系统·思考｜思考块 <b>⏹</b> 结束思考｜Ctrl+Enter 生成｜F2 定稿</span>
+    </footer>
+  </main>
+
+  <aside id="previewPane" hidden>
+    <h3>👁 LLM 视角预览</h3>
+    <div id="previewMsgs" class="hint">chat 模式下发送给模型的消息序列（所见即所发）</div>
+  </aside>
+</div>
+
+<div id="toast" hidden></div>
+<input type="file" id="importFile" accept=".md,.markdown,.txt" hidden>
+
+<script type="module" src="app.js?v=2"></script>
+</body>
+</html>

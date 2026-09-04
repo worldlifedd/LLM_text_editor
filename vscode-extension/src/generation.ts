@@ -1,9 +1,9 @@
 // 生成控制器：SSE → 流式插入、ppl 对账、定稿/锁定/追加块、状态栏与面板刷新。
 import * as vscode from "vscode";
 import { apiGenerate, apiSkills, apiStop, GenParams, GenUpdate, GenerateRequest } from "./api";
-import { newDocumentText, parseDoc, skillSystemContent } from "./docmodel";
+import { cotBody, newDocumentText, parseDoc, skillSystemContent, THINK_CLOSE, THINK_OPEN } from "./docmodel";
 import { Decorator, foldingRanges } from "./decorations";
-import { DocState, emptyPpl, PplSeg, reconcileActivePpl, StateStore } from "./state";
+import { DocState, emptyPpl, mergePrefillPpl, padSegTo, PplSeg, reconcileActivePpl, StateStore } from "./state";
 
 /** 面板通知消息类型。 */
 export interface PplInfo {
@@ -104,15 +104,13 @@ export class GenerationController {
     // 等待上一轮的增量插入全部落地，再基于最新文档做对账
     await this.editQueue;
 
-    // 确保存在活动生成单元（最后一块为 generate）
+    // 活动生成单元：parseDoc 保证末位是 generate 块——末尾没有正文时会虚拟
+    // 一个位于文末的空块，故这里不再插入语义冗余的 <!-- generate --> 占位
+    //（该标记只在"定稿开新块"时才真正需要，用于分隔相邻生成块）。
     let parsed = parseDoc(doc.getText());
     if (!parsed.active) {
-      await editor.edit((e) => e.insert(new vscode.Position(doc.lineCount, 0), "\n\n<!-- generate -->\n"));
-      parsed = parseDoc(doc.getText());
-      if (!parsed.active) {
-        vscode.window.showErrorMessage("无法创建生成块");
-        return;
-      }
+      vscode.window.showErrorMessage("无法定位活动生成块");
+      return;
     }
 
     const activeText = parsed.active.content;
@@ -124,14 +122,19 @@ export class GenerationController {
     );
     state.activePpl = seg;
     this.pendingSeg = null;
-    // 思维链基线：活动 cot 块（blocks 倒数第二块、紧邻活动生成块）已有内容对账
+    // 思维链基线：活动 cot 块（blocks 倒数第二块、紧邻活动生成块）已有内容对账。
+    // 再 padSegTo 兜底：上一轮若被中断且对账被跳过，state 里的段会短于 cot 块
+    // 内容，不补齐就会把整块（含本轮新增）压成单个 null 段、全部不着色。
     const cotBlk = parsed.blocks[parsed.blocks.length - 2];
     const cotSeg =
       cotBlk && cotBlk.type === "cot"
-        ? reconcileActivePpl(
-            state.activeCotPpl.token_texts,
-            state.activeCotPpl.token_ppls,
-            cotBlk.content
+        ? padSegTo(
+            reconcileActivePpl(
+              state.activeCotPpl.token_texts,
+              state.activeCotPpl.token_ppls,
+              cotBody(cotBlk.content)
+            ),
+            cotBody(cotBlk.content)
           )
         : emptyPpl();
     state.activeCotPpl = cotSeg;
@@ -139,7 +142,8 @@ export class GenerationController {
     // 本轮基线段（覆盖 activeText 已有着色）。服务端 token_texts 为全量
     // 累计（join(token_texts) == cum_text），合并 = 基线 + 本轮累计，
     // 不能与不断膨胀的 activePpl 自身拼接（会重复累计）。
-    const baseline: PplSeg = {
+    // prefill_ppl 事件到达时会被替换（编辑文本的 prefill 打分见下）。
+    let baseline: PplSeg = {
       token_texts: [...seg.token_texts],
       token_ppls: [...seg.token_ppls],
     };
@@ -159,10 +163,19 @@ export class GenerationController {
     const ctrl = new AbortController();
     this.ctrl = ctrl;
     this.generating = true;
-    this.cb.statusBar("⏳ 生成中…（再按 Ctrl+Enter 停止）");
+    // 续写会把整段思维链回灌进 prompt（正文是否已开始均回灌），prefill 需
+    // 数秒（随长度线性增长）。首 token 到达前界面无任何变化，不说明原因
+    // 容易被当成卡死。
+    const resumeLen = cotBlk?.type === "cot" ? cotBlk.content.length : 0;
+    this.cb.statusBar(
+      resumeLen > 0
+        ? `⏳ 预填充 ${resumeLen} 字思维链…（再按 Ctrl+Enter 停止）`
+        : "⏳ 生成中…（再按 Ctrl+Enter 停止）"
+    );
     this.cb.notifyPanel({ type: "gen", generating: true });
     let lastCum = 0;
     let lastReasoning = 0;
+    let gotFirst = false; // 首 token 到达后把"预填充"提示换回"生成中"
 
     const onUpdate = (u: GenUpdate) => {
       const delta = u.cum_text.slice(lastCum);
@@ -170,6 +183,10 @@ export class GenerationController {
       const rCum = u.reasoning_cum || "";
       const rDelta = rCum.slice(lastReasoning);
       lastReasoning = rCum.length;
+      if (!gotFirst && (delta || rDelta)) {
+        gotFirst = true;
+        this.cb.statusBar("⏳ 生成中…（再按 Ctrl+Enter 停止）");
+      }
       if (u.cache_info) this.lastCacheInfo = u.cache_info;
       if (rDelta) this.insertReasoningDelta(rDelta);
       if (delta) this.insertDelta(delta);
@@ -196,24 +213,30 @@ export class GenerationController {
         if (cur.startsWith(merged.token_texts.join(""))) {
           ds.state.activePpl = reconcileActivePpl(merged.token_texts, merged.token_ppls, cur);
         }
-        // cot 同步对账（内容已落地时；blocks 末位是活动块，cot 在倒数第二）
+        // cot 同步对账（blocks 末位是活动块，cot 在倒数第二）。
+        // 不做 startsWith 前置判定：文档落地滞后于 SSE 是常态，加了判定就
+        // 只有流结束那一刻能对上，生成全程思维链都不着色。reconcileActivePpl
+        // 本身按公共前缀保留已落地部分的着色，未落地的段下一帧会补上——
+        // rMerged 每帧由 cotSeg 重算，不读 state.activeCotPpl，不会自噬。
+        // base 用 cotBody 剔除 <think>/闭标签（cot 自包含完整思考区）。
         const cotNow = parsedDs.blocks[parsedDs.blocks.length - 2];
-        if (
-          cotNow &&
-          cotNow.type === "cot" &&
-          cotNow.content.startsWith(rMerged.token_texts.join(""))
-        ) {
+        if (cotNow && cotNow.type === "cot") {
           ds.state.activeCotPpl = reconcileActivePpl(
             rMerged.token_texts,
             rMerged.token_ppls,
-            cotNow.content
+            cotBody(cotNow.content)
           );
         }
       }
       const parsedNow = parseDoc(this.docText());
       if (parsedNow.active) this.emitPpl(parsedNow, this.state.get(this.currentUri()), u.cache_info || "");
       this.cb.refreshDecorations();
-      if (u.final) this.finish("✅ 生成完成" + (u.cache_info ? `｜${u.cache_info}` : ""));
+      if (u.final) {
+        // 思考区闭合则补写闭标签（cot 自包含完整思考区；未闭合保持"续写思考"
+        // 状态，用户删/留闭标签即可所见即所得地控制行为）
+        if (u.reasoning_closed) this.closeReasoningTag();
+        this.finish("✅ 生成完成" + (u.cache_info ? `｜${u.cache_info}` : ""));
+      }
     };
 
     try {
@@ -225,6 +248,25 @@ export class GenerationController {
             const parsedNow = parseDoc(this.docText());
             if (parsedNow.active)
               this.emitPpl(parsedNow, this.state.get(this.currentUri()), "");
+          },
+          // prefill 打分：服务端对活动块文本（含手动编辑部分）的逐 token ppl。
+          // 手动编辑的文字由此获得真实困惑度着色，而非沿用旧色或灰显
+          onPrefillPpl: (d) => {
+            const merged = mergePrefillPpl(baseline, activeText, d);
+            if (!merged) return;
+            baseline = merged;
+            const ds = this.session();
+            if (ds) {
+              ds.state.activePpl = reconcileActivePpl(
+                baseline.token_texts,
+                baseline.token_ppls,
+                activeText
+              );
+              this.cb.refreshDecorations();
+              const parsedNow = parseDoc(this.docText());
+              if (parsedNow.active)
+                this.emitPpl(parsedNow, this.state.get(this.currentUri()), "");
+            }
           },
           onUpdate,
           onError: (msg) => {
@@ -245,10 +287,14 @@ export class GenerationController {
       this.cb.notifyPanel({ type: "gen", generating: false });
       // 流结束：等编辑队列全部落地后做最终对账，保证尾部着色完整
       const pending = this.pendingSeg;
+      const pendingCot = this.pendingCotSeg;
       this.editQueue = this.editQueue.then(() => {
+        // 思维链对账先于守卫执行：state.activeCotPpl 是下一轮续写的基线，
+        // 若被"已开启新一轮"挡下就再也补不回来——下一轮会拿空基线去对账，
+        // 把整块思维链压成单个 null 段（表现为思维链完全不着色）。
+        this.applyPendingCotSeg(pendingCot);
         if (this.pendingSeg !== pending) return; // 已开启新一轮，交由新轮处理
         this.applyPendingSeg();
-        this.applyPendingCotSeg();
         this.pendingSeg = null;
         this.pendingCotSeg = null;
         this.cb.refreshDecorations();
@@ -290,9 +336,12 @@ export class GenerationController {
     );
   }
 
-  /** 同上，思维链段：写入活动 cot 块的 ppl。 */
-  private applyPendingCotSeg(): void {
-    if (!this.pendingCotSeg) return;
+  /** 同上，思维链段：写入活动 cot 块的 ppl。
+   *  seg 可显式传入（流结束时本轮捕获的快照）——新一轮抢先开始时
+   *  this.pendingCotSeg 已被覆盖，此时必须用快照才能补回本轮对账。 */
+  private applyPendingCotSeg(seg?: PplSeg | null): void {
+    const target = seg ?? this.pendingCotSeg;
+    if (!target) return;
     const s = this.session();
     if (!s) return;
     const parsed = parseDoc(s.doc.getText());
@@ -301,9 +350,9 @@ export class GenerationController {
     const cot = parsed.blocks[parsed.blocks.length - 2];
     if (!cot || cot.type !== "cot") return;
     s.state.activeCotPpl = reconcileActivePpl(
-      this.pendingCotSeg.token_texts,
-      this.pendingCotSeg.token_ppls,
-      cot.content
+      target.token_texts,
+      target.token_ppls,
+      cotBody(cot.content)
     );
   }
 
@@ -315,7 +364,10 @@ export class GenerationController {
       const parsed = parseDoc(editor.document.getText());
       const act = parsed.active;
       if (!act) return;
-      const pos = editor.document.positionAt(act.contentEnd);
+      // 用 insertEnd（块末尾）而非 contentEnd：后者已剥离尾部空白，
+      // 逐段插入会把空白不断挤到后面，文档内容与服务端的 token 序列错位
+      // → 困惑度着色对不上账。
+      const pos = editor.document.positionAt(act.insertEnd);
       this.selfEdit = true;
       return editor
         .edit((e) => e.insert(pos, delta), { undoStopBefore: false, undoStopAfter: false })
@@ -349,8 +401,10 @@ export class GenerationController {
         this.selfEdit = true;
         try {
           const pos = editor.document.positionAt(act.blockStart);
+          // 思考区开标签直接写进文档：cot 块自包含完整思考区（所见即所得，
+          // 用户可编辑标签控制"续写思考 / 直接出正文"）
           await editor.edit(
-            (e) => e.insert(pos, "<!-- cot\n-->\n\n"),
+            (e) => e.insert(pos, "<!-- cot\n" + THINK_OPEN + "\n-->\n\n"),
             { undoStopBefore: false, undoStopAfter: false }
           );
         } finally {
@@ -362,7 +416,8 @@ export class GenerationController {
       }
       this.selfEdit = true;
       try {
-        const pos = editor.document.positionAt(cot.contentEnd);
+        // 同上：追加到注释结束标记之前，不能用 contentEnd
+        const pos = editor.document.positionAt(cot.insertEnd);
         await editor.edit(
           (e) => e.insert(pos, delta),
           { undoStopBefore: false, undoStopAfter: false }
@@ -372,6 +427,34 @@ export class GenerationController {
       }
       // 思维链文本落地后立即补齐着色（与正文 insertDelta 同思路）
       this.applyPendingCotSeg();
+      this.cb.refreshDecorations();
+    });
+  }
+
+  /** 思考区闭合：在活动 cot 块末尾补写闭标签（经队列串行，保证文本已落地）。
+   *  仅当模型确实输出过闭标签（reasoning_closed）时调用——用户手动停止或
+   *  思考被截断时不补，cot 保持未闭合，下次生成续写思考（所见即所得）。 */
+  private closeReasoningTag(): void {
+    this.editQueue = this.editQueue.then(async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.document.languageId !== "markdown") return;
+      const parsed = parseDoc(editor.document.getText());
+      const act = parsed.active;
+      if (!act) return;
+      const cot = parsed.blocks[parsed.blocks.length - 2];
+      if (!cot || cot.type !== "cot") return;
+      if (cot.content.includes(THINK_CLOSE)) return;      // 已闭合
+      if (!cotBody(cot.content)) return;                  // 无思考内容
+      this.selfEdit = true;
+      try {
+        const pos = editor.document.positionAt(cot.insertEnd);
+        await editor.edit(
+          (e) => e.insert(pos, "\n" + THINK_CLOSE),
+          { undoStopBefore: false, undoStopAfter: false }
+        );
+      } finally {
+        this.selfEdit = false;
+      }
       this.cb.refreshDecorations();
     });
   }
@@ -419,20 +502,21 @@ export class GenerationController {
         content: parsed.active.content,
       });
     }
-    // 思维链块冻结：活动 cot（blocks 倒数第二块）同样定稿着色
+    // 思维链块冻结：活动 cot（blocks 倒数第二块）同样定稿着色。
+    // cot 块自包含 <think>/闭标签，比较与存盘均用 cotBody 剔除标签
     const cotBlk = parsed.blocks[parsed.blocks.length - 2];
     if (
       cotBlk &&
       cotBlk.type === "cot" &&
       state.activeCotPpl.token_texts.length &&
-      "".concat(...state.activeCotPpl.token_texts) === cotBlk.content
+      "".concat(...state.activeCotPpl.token_texts) === cotBody(cotBlk.content)
     ) {
       state.finalized.set(cotBlk.index, {
         seg: {
           token_texts: [...state.activeCotPpl.token_texts],
           token_ppls: [...state.activeCotPpl.token_ppls],
         },
-        content: cotBlk.content,
+        content: cotBody(cotBlk.content),
       });
     }
     // 锁定前序全部块，聚焦新的活动块

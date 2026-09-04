@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
+.venv/
 saves/
 *.log
 .trae/
+.workbuddy/
 pylibs/
 node_modules/
 *.vsix
@@ -13,3 +15,12 @@ vscode-extension/python/
 .plans/
 .vscode/
 models/
+# 诊断脚本产物：tests/diag_cot_resume.mjs 自动打包的逻辑模块 + 导出的真实数据
+.esbuild-test/
+tests/.cot_resume_data.json
+tests/.cot_frames.json
+# 临时诊断脚本与运行产物（不提交），vscode 打包缓存
+tests/diag_*.py
+tests/diag_*.mjs
+tests/diag_*.js
+vscode-extension/tmp/
