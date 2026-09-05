@@ -287,6 +287,7 @@ def generate(req: GenerateRequest):
                         "token_ppls": prefill_p,
                     })
 
+            prev_tokens = 0  # 上一帧累积 token 数（各后端 token_texts 均为全量快照）
             for upd in backend.generate_stream(prompt, **gen_kwargs):
                 if _GEN_ABORT.is_set():
                     # 双保险：停止信号在进入 generate_stream 后（prefill 中）才
@@ -301,9 +302,14 @@ def generate(req: GenerateRequest):
                 if _GEN_STATS["start"] is None:
                     # tps 从首个 token 起算：不含 prefill 打分耗时
                     _GEN_STATS["start"] = time.time()
-                _GEN_STATS["tokens"] += len(upd.token_texts or []) + len(
+                # 增量统计：GenUpdate 携带的是从生成开始到当前的累积 token 列表，
+                # 直接 += len() 会把 1+2+…+N 全部累加（N≈80 时虚报约 3 千），
+                # 必须取本帧与上一帧的差值
+                cur_tokens = len(upd.token_texts or []) + len(
                     upd.reasoning_token_texts or []
                 )
+                _GEN_STATS["tokens"] += cur_tokens - prev_tokens
+                prev_tokens = cur_tokens
                 cache_note = getattr(backend, "last_cache_info", "")
                 yield _sse_event("update", {
                     "cum_text": upd.cum_text,
