@@ -25,6 +25,8 @@ _require_llama_cpp）。
 import json
 import math
 import os
+import queue
+import sys
 import threading
 from dataclasses import dataclass, field
 
@@ -462,15 +464,21 @@ class LocalBackend:
         """上下文困惑度：一次前向传播 exp(mean CE)。提示词准确度指标。"""
         return self.score_context(text)[0]
 
-    def score_context(self, context: str, tail_text: str = ""):
+    def score_context(self, context: str, tail_text: str = "", abort_event=None):
         """上下文打分（单次前向）：整段困惑度 + 尾部文本逐 token 困惑度。
 
         prefill 本就要前向整个上下文，故同一趟同时产出 prompt 困惑度与
         尾部文本（活动块内手动编辑的部分）的逐 token ppl，前端据此为
         编辑文本着色。返回 (ctx_ppl, tail_token_texts, tail_token_ppls)；
         ctx_ppl 不可用时为 nan，尾部无法按 token 边界对齐时为空列表。
+
+        abort_event：可选停止信号。命中（停止请求在打分开始前已到达）时
+        跳过整趟前向直接返回不可用——避免无用 prefill 拖住停止生效。
+        （单次前向本身不可中断；打分开始后到达的停止由调用方兜底。）
         """
         if not self.loaded or not context.strip():
+            return float("nan"), [], []
+        if abort_event is not None and abort_event.is_set():
             return float("nan"), [], []
         torch = _require_torch()[0]
         enc = self.tokenizer(context, return_tensors="pt").to(self.model.device)
@@ -1074,7 +1082,7 @@ class LlamaCppBackend:
         """上下文困惑度：分块批量前向打分 exp(mean CE)。提示词准确度指标。"""
         return self.score_context(text)[0]
 
-    def score_context(self, context: str, tail_text: str = ""):
+    def score_context(self, context: str, tail_text: str = "", abort_event=None):
         """上下文打分（单趟 eval）：整段困惑度 + 尾部文本逐 token 困惑度。
 
         与 llama.cpp 官方 perplexity 工具同思路：reset 后分块 eval，块内
@@ -1087,8 +1095,14 @@ class LlamaCppBackend:
 
         tail_text（活动块手动编辑的文本，位于 context 末尾）在同一趟内取得
         其逐 token ppl，前端据此为编辑文本着色。返回契约同 LocalBackend。
+
+        abort_event：可选停止信号。分块 eval 的块间/逐 token 迭代内检查，
+        命中即中止打分（已 eval 的部分保持为 KV 前缀，下次生成可复用）→
+        prefill 阶段停止也能即时生效，无需等整趟 eval 跑完。
         """
         if not self.loaded or not context.strip():
+            return float("nan"), [], []
+        if abort_event is not None and abort_event.is_set():
             return float("nan"), [], []
         try:
             import numpy as np
@@ -1102,9 +1116,9 @@ class LlamaCppBackend:
             toks = toks[-limit:]
         try:
             self._llm.reset()
-            log_probs = self._ppl_batched(toks, np)
-            if log_probs is None:
-                log_probs = self._ppl_one_by_one(toks, np)
+            log_probs = self._ppl_batched(toks, np, abort_event=abort_event)
+            if log_probs is None and (abort_event is None or not abort_event.is_set()):
+                log_probs = self._ppl_one_by_one(toks, np, abort_event=abort_event)
         except Exception:  # noqa: BLE001  eval 接口不兼容等 → 退化为不可用
             return float("nan"), [], []
         if not log_probs:
@@ -1141,10 +1155,12 @@ class LlamaCppBackend:
             return [], []  # 对齐失配（尾部含特殊 token 等）→ 放弃
         return texts, ppls
 
-    def _ppl_one_by_one(self, toks, np):
+    def _ppl_one_by_one(self, toks, np, abort_event=None):
         """逐 token eval 打分（兼容回退路径）。"""
         log_probs = []
         for i in range(len(toks) - 1):
+            if abort_event is not None and abort_event.is_set():
+                return []  # 停止：中止打分
             self._llm.eval([toks[i]])
             logits = self._read_logits(np)
             if logits is None:
@@ -1154,7 +1170,7 @@ class LlamaCppBackend:
             log_probs.append(float(logits[toks[i + 1]]) - lse)
         return log_probs
 
-    def _ppl_batched(self, toks, np):
+    def _ppl_batched(self, toks, np, abort_event=None):
         """分块批量 eval 打分（llama-cpp-python 内部 batch 接口）。
 
         逐位置 logits 需在 batch 上显式置位（公共 eval() 只给末位产出
@@ -1162,6 +1178,9 @@ class LlamaCppBackend:
         logits → _decode_eval_batch → llama_get_logits_ith 逐位置读取，
         并同步 input_ids/n_tokens 台账保证后续 generate 前缀复用。
         接口不兼容（版本差异）返回 None → 调用方回退逐 token 路径。
+
+        abort_event：可选停止信号。块间检查，命中返回 None（已 eval 的
+        前缀保持为 KV 缓存，下次生成可复用）。
         """
         llama_cpp = _require_llama_cpp()
         get_ith = getattr(llama_cpp, "llama_get_logits_ith", None)
@@ -1184,6 +1203,8 @@ class LlamaCppBackend:
         end = len(toks) - 1  # 末 token 无"下一 token"可打分，无需 eval
         pos = 0
         while pos < end:
+            if abort_event is not None and abort_event.is_set():
+                return None  # 停止：中止打分，已 eval 前缀保持为 KV 缓存
             chunk = toks[pos: min(pos + bs, end)]
             n = len(chunk)
             llm._batch.reset()
@@ -1507,11 +1528,21 @@ class OpenAICompatBackend:
     # ---------------------------------------------------------------- 生成
     def stop(self):
         self._stop_event.set()
-        if self._resp is not None:
-            try:
-                self._resp.close()
-            except Exception:  # noqa: BLE001
-                pass
+        if self._resp is None:
+            return
+        # 打断读线程的阻塞 recv：Windows 上 shutdown() 唤不醒另一线程的 recv，
+        # 而 close() 更会让调用方卡死（读线程正阻塞在 recv 时，实测会挂住，
+        # 见 tests/dbg_shutdown.py）。改为把底层 socket 读超时设为短值——
+        # SO_RCVTIMEO 是 fd 级选项，阻塞中的 recv 会在超时后抛异常，读线程
+        # 捕获后视作正常停止，并在其 finally 中关闭连接，资源即刻回收；
+        # 主生成器则在 ≤0.2s 的队列轮询周期内收到停止信号收尾。
+        try:
+            conn = getattr(getattr(self._resp, "raw", None), "_connection", None)
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                sock.settimeout(0.5)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _post_stream(self, payload):
         url = f"{self.base_url}/chat/completions"
@@ -1539,7 +1570,16 @@ class OpenAICompatBackend:
         return resp
 
     def generate_stream(self, prompt, **gen_params):
-        """流式生成。prompt 为 messages 列表；yield GenUpdate。"""
+        """流式生成。prompt 为 messages 列表；yield GenUpdate。
+
+        实现为「读线程 + 队列」：请求响应由独立读线程迭代解析并写入队列，
+        主生成器以 0.2s 超时轮询队列，每次超时检查停止信号。这样即使服务端
+        长时间不产 token（静默期，如思考/缓冲），/api/stop 也能在下一个轮询
+        周期内生效——主线程不再被阻塞 recv 卡死（Windows 上关闭 fd 无法打断
+        另一线程的阻塞读，见 tests/dbg_shutdown.py 与 repro_stop_api_silent.py）。
+        停止时读线程可能仍阻塞在 socket 上：stop() 通过把 socket 读超时设为
+        短值（SO_RCVTIMEO）令其超时退出，读线程 finally 关闭连接并回收资源。
+        """
         if not self.loaded:
             raise RuntimeError("API 未连接，请先在顶栏配置并连接")
 
@@ -1565,43 +1605,82 @@ class OpenAICompatBackend:
         if "logprobs" in payload and self.supports_logprobs is None:
             self.supports_logprobs = True  # 200 通过，待首条数据确认
 
+        items: "queue.Queue" = queue.Queue()
+        _DONE = object()  # 哨兵：流正常结束 / 读线程异常
+
+        def _reader():
+            """读线程：迭代 SSE 行 → 解析 → 入队（仅队列与停止信号交互）。"""
+            try:
+                for raw in resp.iter_lines(decode_unicode=True):
+                    if self._stop_event.is_set():
+                        break
+                    if not raw or not raw.startswith("data:"):
+                        continue
+                    data = raw[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (chunk.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content") or ""
+                    # 思维链（DeepSeek/GLM/Qwen 的 reasoning_content；部分服务
+                    # 用 reasoning 字段）。API 不返回 reasoning 的 logprobs，
+                    # 思维链困惑度着色仅本地/llama.cpp 后端可用
+                    rpiece = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    if rpiece:
+                        self.reasoning_seen = True
+                    # logprobs 逐 token 困惑度（服务端支持时）
+                    lps = []
+                    for ent in (choice.get("logprobs") or {}).get("content") or []:
+                        tok = ent.get("token") or ""
+                        logprob = ent.get("logprob")
+                        if tok and logprob is not None:
+                            lps.append((tok, math.exp(min(-logprob, 20.0))))
+                    if piece or rpiece or lps:
+                        items.put((piece, rpiece, lps))
+            except (ValueError, requests.RequestException):
+                # stop() 关闭连接导致迭代异常 → 视为正常停止，入队哨兵即可；
+                # 真实网络错误 → 入队异常对象，主生成器重新抛出（与旧行为一致）
+                if not self._stop_event.is_set():
+                    items.put(sys.exc_info()[1])
+            finally:
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                items.put(_DONE)
+
+        threading.Thread(target=_reader, daemon=True, name="api-stream-reader").start()
+
         cum_text = ""
         reasoning_cum = ""
         token_texts: list = []
         token_ppls: list = []
         final_snapshot = None
         try:
-            for raw in resp.iter_lines(decode_unicode=True):
-                if self._stop_event.is_set():
-                    break
-                if not raw or not raw.startswith("data:"):
-                    continue
-                data = raw[5:].strip()
-                if data == "[DONE]":
-                    break
+            while True:
                 try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
+                    item = items.get(timeout=0.2)
+                except queue.Empty:
+                    # 队列空且停止信号未置位 → 继续等（静默期也保持响应）
+                    if self._stop_event.is_set():
+                        break
                     continue
-                choice = (chunk.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                piece = delta.get("content") or ""
-                # 思维链（DeepSeek/GLM/Qwen 的 reasoning_content；部分服务
-                # 用 reasoning 字段）。API 不返回 reasoning 的 logprobs，
-                # 思维链困惑度着色仅本地/llama.cpp 后端可用
-                rpiece = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                if item is _DONE:
+                    break
+                if isinstance(item, BaseException):
+                    raise item  # 读线程遇到的真实网络错误
+                piece, rpiece, lps = item
                 if piece:
                     cum_text += piece
                 if rpiece:
                     reasoning_cum += rpiece
-                    self.reasoning_seen = True
-                # logprobs 逐 token 困惑度（服务端支持时）
-                for ent in (choice.get("logprobs") or {}).get("content") or []:
-                    tok = ent.get("token") or ""
-                    logprob = ent.get("logprob")
-                    if tok and logprob is not None:
-                        token_texts.append(tok)
-                        token_ppls.append(math.exp(min(-logprob, 20.0)))
+                for tok, ppl in lps:
+                    token_texts.append(tok)
+                    token_ppls.append(ppl)
                 yield GenUpdate(
                     cum_text=cum_text,
                     reasoning_cum=reasoning_cum,
@@ -1610,15 +1689,7 @@ class OpenAICompatBackend:
                     # API 服务端的 reasoning_content 是协议级字段，天然闭合
                     reasoning_closed=bool(reasoning_cum),
                 )
-        except (ValueError, requests.RequestException):
-            # stop() 关闭连接导致迭代异常 → 视为正常停止
-            if not self._stop_event.is_set():
-                raise
         finally:
-            try:
-                resp.close()
-            except Exception:  # noqa: BLE001
-                pass
             self._resp = None
             if self.supports_logprobs and not token_ppls:
                 self.supports_logprobs = False  # 200 但从未返回 logprobs 数据

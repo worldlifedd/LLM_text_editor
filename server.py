@@ -77,6 +77,12 @@ _GEN_LOCK = threading.Lock()  # 服务级串行化：同一时刻只允许一个
 # 当前/最近一次生成的统计（/api/monitor 上报）：tokens 为正文+思维链 token 数
 _GEN_STATS = {"tokens": 0, "start": None, "end": None}
 
+# 服务级停止信号：/api/stop 置位，新生成请求清除。
+# 后端 _stop_event 在 score_context/prefill 阶段（生成未产出任何 token）会被
+# generate_stream 开头的重置吞掉——该阶段点停止必须靠它兜底：_stream() 在
+# 进入 generate_stream 前检查，命中则直接结束（锁立即释放，SSE 正常收尾）。
+_GEN_ABORT = threading.Event()
+
 
 class LoadRequest(BaseModel):
     mode: str = "local"
@@ -227,6 +233,7 @@ def generate(req: GenerateRequest):
 
     if not _GEN_LOCK.acquire(blocking=False):
         return JSONResponse({"error": "已有生成任务进行中"}, status_code=409)
+    _GEN_ABORT.clear()  # 新一轮生成：清除上一次 /api/stop 的残留信号
 
     p = req.params
     gen_kwargs = dict(
@@ -249,12 +256,29 @@ def generate(req: GenerateRequest):
                 ctx, prefill_t, prefill_p = None, [], []
                 try:
                     if hasattr(backend, "score_context"):
-                        ctx, prefill_t, prefill_p = backend.score_context(prompt, active)
+                        # 打分阶段也是停止检查点：llamacpp 分块 eval 块间即时
+                        # 中止（已 eval 前缀保持为 KV 缓存）；local 单次前向在
+                        # 开始前中止（前向本身不可中断，由下方兜底）
+                        ctx, prefill_t, prefill_p = backend.score_context(
+                            prompt, active, abort_event=_GEN_ABORT
+                        )
                     else:
                         ctx = backend.compute_context_ppl(prompt)
                     ctx = round(ctx, 2) if ctx == ctx else None
                 except Exception:  # noqa: BLE001
                     ctx, prefill_t, prefill_p = None, [], []
+
+                # 停止请求在 prefill 打分阶段到达（该阶段不响应后端
+                # stop_event，且 generate_stream 开头的 _stop_event 重置会
+                # 吞掉它）→ 直接收尾，不再下发打分事件
+                if _GEN_ABORT.is_set():
+                    yield _sse_event("update", {
+                        "cum_text": "", "reasoning_cum": "",
+                        "token_texts": [], "token_ppls": [],
+                        "reasoning_token_texts": [], "reasoning_token_ppls": [],
+                        "reasoning_closed": False, "final": True, "cache_info": "",
+                    })
+                    return
                 if ctx is not None:
                     yield _sse_event("ctx_ppl", {"ppl": ctx})
                 if prefill_t:
@@ -264,6 +288,16 @@ def generate(req: GenerateRequest):
                     })
 
             for upd in backend.generate_stream(prompt, **gen_kwargs):
+                if _GEN_ABORT.is_set():
+                    # 双保险：停止信号在进入 generate_stream 后（prefill 中）才
+                    # 置位时，后端 event 可能已被开头重置吞掉 → 这里兜底收尾
+                    yield _sse_event("update", {
+                        "cum_text": "", "reasoning_cum": "",
+                        "token_texts": [], "token_ppls": [],
+                        "reasoning_token_texts": [], "reasoning_token_ppls": [],
+                        "reasoning_closed": False, "final": True, "cache_info": "",
+                    })
+                    return
                 if _GEN_STATS["start"] is None:
                     # tps 从首个 token 起算：不含 prefill 打分耗时
                     _GEN_STATS["start"] = time.time()
@@ -301,6 +335,7 @@ def generate(req: GenerateRequest):
 @app.post("/api/stop")
 def stop():
     _backend().stop()
+    _GEN_ABORT.set()
     return {"stopped": True}
 
 

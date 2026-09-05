@@ -36,7 +36,7 @@ class _FakeBackend:
     def build_flat_prompt(self, flat_text):
         return flat_text
 
-    def score_context(self, context, tail_text=""):
+    def score_context(self, context, tail_text="", abort_event=None):
         # tail 恰为 context 后缀时产出逐 token ppl；否则（对齐失败）仅 ppl
         if tail_text and context.endswith(tail_text):
             return 12.34, list(tail_text), [float(ord(c)) % 7 + 1 for c in tail_text]
@@ -120,7 +120,7 @@ print("[2] 空活动文本 → 无 prefill_ppl 事件 OK:", names)
 orig = _FakeBackend.score_context
 
 
-def _boom(self, context, tail_text=""):
+def _boom(self, context, tail_text="", abort_event=None):
     raise RuntimeError("scoring failed")
 
 
@@ -141,9 +141,9 @@ _seen = {}
 _orig_score = _FakeBackend.score_context
 
 
-def _rec_score(self, context, tail_text=""):
+def _rec_score(self, context, tail_text="", abort_event=None):
     _seen["context"] = context
-    return _orig_score(self, context, tail_text)
+    return _orig_score(self, context, tail_text, abort_event=abort_event)
 
 
 _FakeBackend.score_context = _rec_score
