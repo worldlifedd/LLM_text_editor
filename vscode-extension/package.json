@@ -29,6 +29,24 @@
         "category": "GTE"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "gte",
+          "title": "GTE 生成式文本编辑器",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "gte": [
+        {
+          "type": "webview",
+          "id": "gte.monitor",
+          "name": "后端管理与监控"
+        }
+      ]
+    },
     "configuration": {
       "title": "GTE",
       "properties": {

@@ -7,6 +7,8 @@ core.py（文档序列化、上下文组装、困惑度聚合），默认监听 
 
 端点：
 - GET  /api/status   {kind, loaded, loading, message, generating}
+- GET  /api/monitor  status + 模型/显存/内存/生成速率（侧边栏监控面板轮询）
+- POST /api/unload   卸载当前后端模型（释放显存/内存）
 - POST /api/load     {mode, model_path} 或 {mode, base_url, api_key, model}
                      或 {mode, model_path, n_gpu_layers, n_ctx}（mode=llamacpp）
                      → 立即返回 {accepted:true}，实际加载在后台线程，结果经
@@ -26,6 +28,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 import uuid
 from typing import Optional
@@ -70,6 +73,9 @@ def _backend():
 # --------------------------------------------------------------- 加载状态
 _LOADING = {"running": False, "message": ""}
 _GEN_LOCK = threading.Lock()  # 服务级串行化：同一时刻只允许一个生成流
+
+# 当前/最近一次生成的统计（/api/monitor 上报）：tokens 为正文+思维链 token 数
+_GEN_STATS = {"tokens": 0, "start": None, "end": None}
 
 
 class LoadRequest(BaseModel):
@@ -234,6 +240,7 @@ def generate(req: GenerateRequest):
     )
 
     def _stream():
+        _GEN_STATS.update(tokens=0, start=None, end=None)
         try:
             # 上下文打分：本地 transformers / llama.cpp 模式可用（API 不可用）。
             # score_context 在同一次前向里顺带产出活动块文本（含手动编辑
@@ -257,6 +264,12 @@ def generate(req: GenerateRequest):
                     })
 
             for upd in backend.generate_stream(prompt, **gen_kwargs):
+                if _GEN_STATS["start"] is None:
+                    # tps 从首个 token 起算：不含 prefill 打分耗时
+                    _GEN_STATS["start"] = time.time()
+                _GEN_STATS["tokens"] += len(upd.token_texts or []) + len(
+                    upd.reasoning_token_texts or []
+                )
                 cache_note = getattr(backend, "last_cache_info", "")
                 yield _sse_event("update", {
                     "cum_text": upd.cum_text,
@@ -276,6 +289,7 @@ def generate(req: GenerateRequest):
             traceback.print_exc()  # 命令行留全堆栈，便于调试
             yield _sse_event("error", {"error": str(e)})
         finally:
+            _GEN_STATS["end"] = time.time()
             _GEN_LOCK.release()
 
     return StreamingResponse(
@@ -288,6 +302,100 @@ def generate(req: GenerateRequest):
 def stop():
     _backend().stop()
     return {"stopped": True}
+
+
+# --------------------------------------------------------------- 监控 / 卸载
+# /api/monitor 供 VSCode 侧边栏监控面板轮询（约 2s 一次）。显存/内存采集
+# 依赖可选库（pynvml / psutil），缺失时对应字段为 null，前端隐藏。
+
+def _gpu_mem_mb():
+    """整机 GPU 显存（MB）：pynvml（local/llamacpp 均适用；多卡取第 0 张）。"""
+    try:
+        import pynvml  # noqa: PLC0415（可选依赖，惰性导入）
+
+        pynvml.nvmlInit()
+        info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
+        return info.total // (1024 * 1024), info.used // (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _torch_mem_mb(backend):
+    """transformers 显存（MB）：torch.cuda 统计（仅 local 后端加载后有意义）。"""
+    if backend.kind != "local" or not backend.loaded:
+        return None, None
+    try:
+        import torch  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            return (
+                torch.cuda.memory_allocated() // (1024 * 1024),
+                torch.cuda.memory_reserved() // (1024 * 1024),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def _rss_mb():
+    """服务进程常驻内存（MB）：psutil 可选依赖。"""
+    try:
+        import psutil  # noqa: PLC0415
+
+        return psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@app.get("/api/monitor")
+def monitor():
+    b = _backend()
+    gpu_total, gpu_used = _gpu_mem_mb()
+    torch_alloc, torch_reserved = _torch_mem_mb(b)
+    now = time.time()
+    elapsed = None
+    if _GEN_STATS["start"] is not None:
+        elapsed = round(((_GEN_STATS["end"] or now)) - _GEN_STATS["start"], 1)
+    tokens = _GEN_STATS["tokens"]
+    tps = round(tokens / elapsed, 1) if elapsed and tokens else None
+    return {
+        "kind": _ACTIVE["kind"],
+        "loaded": b.loaded,
+        "loading": _LOADING["running"],
+        "message": _LOADING["message"] or ("已加载" if b.loaded else "未加载"),
+        "generating": _GEN_LOCK.locked(),
+        "model": {
+            # API 后端模型名在 .model（字符串）；local 的 .model 是 torch 对象，
+            # 仅取字符串型回退，避免把模型对象误当名称序列化
+            "name": getattr(b, "model_name", "")
+            or (b.model if isinstance(getattr(b, "model", None), str) else ""),
+            "device": getattr(b, "device", ""),
+            "quant": getattr(b, "quant_info", ""),
+            "context_size": getattr(b, "context_size", 0) or 0,
+            "base_url": getattr(b, "base_url", ""),
+        },
+        "gpu": {
+            "total_mb": gpu_total,
+            "used_mb": gpu_used,
+            "torch_allocated_mb": torch_alloc,
+            "torch_reserved_mb": torch_reserved,
+        },
+        "rss_mb": _rss_mb(),
+        "gen": {"tokens": tokens, "elapsed_s": elapsed, "tps": tps},
+        "pid": os.getpid(),
+    }
+
+
+@app.post("/api/unload")
+def unload():
+    if _GEN_LOCK.locked():
+        return JSONResponse({"error": "生成进行中，请先停止再卸载"}, status_code=409)
+    b = _backend()
+    if not b.loaded:
+        return {"unloaded": False}
+    b.unload()
+    _LOADING["message"] = "已卸载模型（显存/内存已释放）"
+    return {"unloaded": True}
 
 
 @app.get("/api/skills")

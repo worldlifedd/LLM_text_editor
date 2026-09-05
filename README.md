@@ -136,6 +136,8 @@ python app.py
 
 > 若使用仓库根目录的 `server.py`（例如调试最新改动），可在设置 `gte.serverScript` 中指定其绝对路径，插件将优先使用。
 
+**侧边栏「后端管理与监控」**：活动栏 GTE 图标内的控制台——不打开编辑器也能切换后端类型（transformers / llama.cpp / API）、填模型路径与上下文参数并加载/卸载；下方实时监控后端运行情况（约 2s 轮询 `/api/monitor`）：模型/设备/量化/上下文信息、GPU 显存占用进度条（pynvml，另附 torch allocated/reserved）、服务进程内存（psutil）、生成状态与速率（token 数 / 用时 / tok/s，从首个 token 起算不含 prefill）。表单值经 globalState 跨会话记忆（local 与 GGUF 路径分开保存）；两监控库为可选依赖，缺失时对应字段隐藏。
+
 #### 文档格式
 
 文档以 JSON 块数组保存在服务端 `saves/*.json`（含逐 token 困惑度数据）；Markdown 仅作「导入MD」/「导出MD」的交换格式。交换格式中提示词块是 `<!-- prompt ... -->` 注释（渲染不可见），生成块是可见正文，每块生成正文前有一行 `<!-- generate -->` 注释作为块边界标记（用于分隔相邻生成块、标记空的活动生成单元）：
@@ -246,7 +248,7 @@ Gradio 端在生成块上方提供「🧠 思维链（当前轮）」流式单�
 │   └── 中文散文写作/SKILL.md
 ├── saves/            # 文档保存目录（运行时生成）
 ├── vscode-extension/ # VSCode 插件前端（WebviewPanel 承载 web/ 块编辑器）
-│   ├── src/          # 插件源码（TS）：extension（入口）/ webEditor（Webview 代理）/ server / api
+│   ├── src/          # 插件源码（TS）：extension（入口）/ webEditor（Webview 代理）/ monitorPanel（侧边栏监控）/ server / api
 │   ├── python/       # 构建产物：打包时从仓库根自动复制（不入 git）
 │   ├── package.json  # 命令、配置项声明
 │   └── esbuild.js    # 构建/打包脚本（extension + webview 双入口 + 同步 python/）

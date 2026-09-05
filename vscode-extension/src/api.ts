@@ -100,6 +100,46 @@ export function apiStop(): Promise<{ stopped: boolean }> {
   return postJson("/api/stop", {});
 }
 
+// ---------------------------------------------------------------- 监控 / 卸载
+
+/** /api/monitor 响应：侧边栏监控面板轮询（可选库缺失的字段为 null）。 */
+export interface MonitorInfo {
+  kind: string;
+  loaded: boolean;
+  loading: boolean;
+  message: string;
+  generating: boolean;
+  model: {
+    name: string;
+    device: string;
+    quant: string;
+    context_size: number;
+    base_url: string;
+  };
+  gpu: {
+    total_mb: number | null;
+    used_mb: number | null;
+    /** transformers 显存（仅 local 后端）：allocated / reserved（MB） */
+    torch_allocated_mb: number | null;
+    torch_reserved_mb: number | null;
+  };
+  /** 服务进程常驻内存（MB；psutil 缺失为 null） */
+  rss_mb: number | null;
+  /** 最近一次生成统计（tps 从首个 token 起算，不含 prefill 打分） */
+  gen: { tokens: number; elapsed_s: number | null; tps: number | null };
+  pid: number;
+}
+
+export function apiMonitor(): Promise<MonitorInfo> {
+  return fetch(`${serverUrl()}/api/monitor`, { signal: AbortSignal.timeout(3000) }).then(
+    (r) => r.json() as Promise<MonitorInfo>
+  );
+}
+
+export function apiUnload(): Promise<{ unloaded: boolean }> {
+  return postJson("/api/unload", {});
+}
+
 export function apiSkills(): Promise<SkillInfo[]> {
   // 服务端为 GET 端点（POST 会返回 405）
   return fetch(`${serverUrl()}/api/skills`, { signal: AbortSignal.timeout(3000) }).then(
