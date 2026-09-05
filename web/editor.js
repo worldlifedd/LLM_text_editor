@@ -9,7 +9,7 @@ import {
   normalizeCotBlock,
   newBlock,
   ensureActive,
-} from "./model.js?v=2";
+} from "./model.js";
 
 const BLOCK_ACTIONS = [
   { type: "prompt", label: "指令", hint: "用户输入，→ user 消息" },

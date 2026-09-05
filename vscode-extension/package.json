@@ -19,90 +19,16 @@
   "contributes": {
     "commands": [
       {
-        "command": "gte.generate",
-        "title": "GTE: 生成 / 停止（同一按键切换）",
-        "category": "GTE"
-      },
-      {
-        "command": "gte.stop",
-        "title": "GTE: 停止生成",
-        "category": "GTE"
-      },
-      {
-        "command": "gte.finalizeBlock",
-        "title": "GTE: 定稿当前块并开启新块",
-        "category": "GTE"
-      },
-      {
-        "command": "gte.addPromptBlock",
-        "title": "GTE: 追加提示词块",
-        "category": "GTE"
-      },
-      {
-        "command": "gte.insertSkillBlock",
-        "title": "GTE: 固化技能为系统提示词块",
-        "category": "GTE"
-      },
-      {
-        "command": "gte.toggleLock",
-        "title": "GTE: 锁定/解锁光标所在块",
-        "category": "GTE"
-      },
-      {
-        "command": "gte.newDocument",
-        "title": "GTE: 新建生成式文本文档",
+        "command": "gte.openWebEditor",
+        "title": "GTE: 打开 Web 编辑器",
         "category": "GTE"
       },
       {
         "command": "gte.showPanel",
-        "title": "GTE: 打开生成控制面板",
+        "title": "GTE: 打开生成控制面板（旧命令别名）",
         "category": "GTE"
       }
     ],
-    "keybindings": [
-      {
-        "command": "gte.generate",
-        "key": "ctrl+enter",
-        "mac": "cmd+enter",
-        "when": "editorTextFocus && editorLangId == markdown"
-      },
-      {
-        "command": "gte.stop",
-        "key": "ctrl+alt+enter",
-        "mac": "cmd+alt+enter",
-        "when": "editorTextFocus && editorLangId == markdown"
-      },
-      {
-        "command": "gte.finalizeBlock",
-        "key": "ctrl+shift+enter",
-        "mac": "cmd+shift+enter",
-        "when": "editorTextFocus && editorLangId == markdown"
-      },
-      {
-        "command": "gte.addPromptBlock",
-        "key": "ctrl+alt+p",
-        "mac": "cmd+alt+p",
-        "when": "editorTextFocus && editorLangId == markdown"
-      }
-    ],
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "gte",
-          "title": "GTE 生成式文本编辑器",
-          "icon": "media/icon.svg"
-        }
-      ]
-    },
-    "views": {
-      "gte": [
-        {
-          "type": "webview",
-          "id": "gte.panel",
-          "name": "生成控制面板"
-        }
-      ]
-    },
     "configuration": {
       "title": "GTE",
       "properties": {
@@ -125,19 +51,6 @@
           "type": "string",
           "default": "",
           "description": "server.py 绝对路径；留空则自动在工作区与扩展目录查找"
-        },
-        "gte.params": {
-          "type": "object",
-          "default": {
-            "max_new_tokens": 256,
-            "do_sample": true,
-            "temperature": 0.8,
-            "top_k": 50,
-            "top_p": 0.95,
-            "repetition_penalty": 1.1,
-            "context_mode": "chat"
-          },
-          "description": "生成参数默认值（可在面板中覆盖）"
         }
       }
     }

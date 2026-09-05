@@ -107,6 +107,70 @@ export function apiSkills(): Promise<SkillInfo[]> {
   );
 }
 
+// ---------------------------------------------------------------- 文档 CRUD
+// 与 web/api.js 的文档端点一一对应（webview 经 postMessage 代理复用本层）。
+
+export interface DocMeta {
+  id: string;
+  title: string;
+  updated_at: string;
+}
+
+export interface DocBlock {
+  type: "prompt" | "system" | "cot" | "generate";
+  content: string;
+  ppl?: { token_texts: string[]; token_ppls: (number | null)[] } | null;
+  closed?: boolean | null;
+}
+
+export interface Doc {
+  id: string;
+  title: string;
+  updated_at?: string;
+  blocks: DocBlock[];
+}
+
+export function apiListDocs(): Promise<DocMeta[]> {
+  return fetch(`${serverUrl()}/api/docs`, { signal: AbortSignal.timeout(3000) }).then(
+    (r) => r.json() as Promise<DocMeta[]>
+  );
+}
+
+export function apiGetDoc(id: string): Promise<Doc> {
+  return fetch(`${serverUrl()}/api/docs/${encodeURIComponent(id)}`, {
+    signal: AbortSignal.timeout(3000),
+  }).then((r) => r.json() as Promise<Doc>);
+}
+
+export function apiSaveDoc(doc: {
+  id: string;
+  title: string;
+  blocks: DocBlock[];
+}): Promise<{ id: string }> {
+  return postJson("/api/docs", doc);
+}
+
+export function apiDeleteDoc(id: string): Promise<{ deleted: boolean }> {
+  return fetch(`${serverUrl()}/api/docs/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(3000),
+  }).then((r) => r.json() as Promise<{ deleted: boolean }>);
+}
+
+export function apiImportMarkdown(
+  text: string,
+  title: string
+): Promise<{ id: string; title: string; blocks: DocBlock[] }> {
+  return postJson("/api/docs/import_md", { text, title });
+}
+
+/** 拉取导出的 Markdown 文本（主进程代存文件）。 */
+export async function fetchExportMd(id: string): Promise<string> {
+  const r = await fetch(`${serverUrl()}/api/docs/${encodeURIComponent(id)}/export_md`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.text();
+}
+
 /** POST /api/generate 并解析 SSE 流。signal 可中止（停止）。 */
 export async function apiGenerate(
   req: GenerateRequest,

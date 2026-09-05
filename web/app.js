@@ -1,14 +1,12 @@
 // 应用编排：文档管理、后端/参数/技能面板、生成控制器（SSE）、快捷键。
-import {
-  apiStatus, apiLoad, apiSkills, apiGenerate, apiStop,
-  apiListDocs, apiGetDoc, apiSaveDoc, apiDeleteDoc, apiImportMarkdown,
-  exportMarkdownUrl,
-} from "./api.js?v=2";
-import { BlockEditor } from "./editor.js?v=2";
+// 平台差异（浏览器直连 fetch / VSCode webview postMessage 代理、设置与
+// 文件对话框等）统一经 platform 抽象层隔离（platform.js）。
+import { platform } from "./platform.js";
+import { BlockEditor } from "./editor.js";
 import {
   newDocumentBlocks, blocksToMessages, pendingCot, reconcilePpl, avgPpl,
   mergePrefillPpl, skillSystemContent,
-} from "./model.js?v=2";
+} from "./model.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -24,7 +22,13 @@ const DEFAULT_PARAMS = {
   enable_thinking: null,
 };
 
-const settings = loadSettings();
+// settings 由 init() 异步装载（webview 端经 postMessage 取 globalState），
+// 装载完成前保持默认值；saveSettings 仅在 bindParams 之后由用户交互触发。
+const settings = {
+  params: { ...DEFAULT_PARAMS },
+  context_mode: "chat",
+  skills: [],
+};
 let allSkills = [];            // [{name, description, instructions}]
 let currentDoc = { id: "", title: "未命名文档" };
 let dirty = false;
@@ -36,20 +40,19 @@ let previewOpen = false;
 
 const editor = new BlockEditor($("editor"), { onChange: markDirty });
 
-function loadSettings() {
-  let saved = {};
-  try {
-    saved = JSON.parse(localStorage.getItem("gte.settings") || "{}");
-  } catch { /* 忽略损坏的本地设置 */ }
-  return {
-    params: { ...DEFAULT_PARAMS, ...(saved.params || {}) },
-    context_mode: saved.context_mode || "chat",
-    skills: saved.skills || [],
-  };
+async function loadSettings() {
+  const saved = (await platform.loadSettings().catch(() => null)) || {};
+  settings.params = { ...DEFAULT_PARAMS, ...(saved.params || {}) };
+  settings.context_mode = saved.context_mode || "chat";
+  settings.skills = saved.skills || [];
 }
 
 function saveSettings() {
-  localStorage.setItem("gte.settings", JSON.stringify(settings));
+  void platform.saveSettings({
+    params: settings.params,
+    context_mode: settings.context_mode,
+    skills: settings.skills,
+  }).catch(() => { /* 存储失败不阻断 UI */ });
 }
 
 // ---------------------------------------------------------------- 通用 UI
@@ -74,22 +77,39 @@ function updateGenButton() {
     : "▶ 生成 (Ctrl+Enter)";
 }
 
+// 脏文档草稿（1s 防抖）：webview 关闭无 beforeunload 确认，靠草稿恢复兜底；
+// 浏览器端顺带获得崩溃恢复能力。
+let draftTimer = null;
+function scheduleDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => {
+    void platform.persistDraft({
+      id: currentDoc.id,
+      title: $("docTitle").value,
+      blocks: editor.plainBlocks(),
+    }).catch(() => { /* 草稿失败不阻断编辑 */ });
+  }, 1000);
+}
+
 function markDirty() {
   dirty = true;
   $("dirtyDot").hidden = false;
+  scheduleDraft();
   if (previewOpen) renderPreview();
 }
 
 function markClean() {
   dirty = false;
   $("dirtyDot").hidden = true;
+  clearTimeout(draftTimer);
+  void platform.persistDraft(null).catch(() => {});
 }
 
 // ---------------------------------------------------------------- 文档
 
 async function refreshDocs() {
   try {
-    const docs = await apiListDocs();
+    const docs = await platform.apiListDocs();
     const ul = $("docList");
     ul.textContent = "";
     for (const d of docs) {
@@ -105,8 +125,8 @@ async function refreshDocs() {
       del.title = "删除文档";
       del.addEventListener("click", async (e) => {
         e.stopPropagation();
-        if (!confirm(`删除文档「${d.title}」？`)) return;
-        await apiDeleteDoc(d.id);
+        if (!(await platform.confirm(`删除文档「${d.title}」？`))) return;
+        await platform.apiDeleteDoc(d.id);
         if (d.id === currentDoc.id) newDoc();
         await refreshDocs();
       });
@@ -124,14 +144,14 @@ async function refreshDocs() {
   }
 }
 
-function confirmDiscard() {
-  return !dirty || confirm("当前文档有未保存修改，放弃并继续？");
+async function confirmDiscard() {
+  return !dirty || platform.confirm("当前文档有未保存修改，放弃并继续？");
 }
 
 async function openDoc(id) {
-  if (!confirmDiscard()) return;
+  if (!(await confirmDiscard())) return;
   try {
-    const doc = await apiGetDoc(id);
+    const doc = await platform.apiGetDoc(id);
     currentDoc = { id: doc.id, title: doc.title };
     $("docTitle").value = doc.title;
     editor.setBlocks((doc.blocks || []).map((b) => ({ ...b })));
@@ -156,7 +176,7 @@ function newDoc() {
 async function saveDoc() {
   try {
     const title = $("docTitle").value.trim() || "未命名文档";
-    const res = await apiSaveDoc({
+    const res = await platform.apiSaveDoc({
       id: currentDoc.id,
       title,
       blocks: editor.plainBlocks(),
@@ -170,32 +190,38 @@ async function saveDoc() {
   }
 }
 
-// 导入 / 导出 Markdown
-$("btnImport").addEventListener("click", () => $("importFile").click());
-$("importFile").addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  e.target.value = "";
-  if (!file) return;
-  if (!confirmDiscard()) return;
+// 导入 / 导出 Markdown（浏览器：本地文件下载；webview：VSCode 文件对话框）
+async function doImport() {
+  let picked = null;
   try {
-    const text = await file.text();
-    const title = file.name.replace(/\.(md|markdown|txt)$/i, "");
-    const res = await apiImportMarkdown(text, title);
+    picked = await platform.pickMarkdownFile();
+  } catch (e) {
+    toast(`导入失败：${e.message}`, true);
+    return;
+  }
+  if (!picked) return;
+  if (!(await confirmDiscard())) return;
+  try {
+    const res = await platform.apiImportMarkdown(picked.text, picked.title);
     await openDoc(res.id);
     toast("已导入 Markdown 并转为块文档");
   } catch (err) {
     toast(`导入失败：${err.message}`, true);
   }
-});
+}
 
-$("btnExport").addEventListener("click", async () => {
+async function doExport() {
   if (!currentDoc.id) await saveDoc();
   if (!currentDoc.id) return;
-  const a = document.createElement("a");
-  a.href = exportMarkdownUrl(currentDoc.id);
-  a.download = `${currentDoc.title || "document"}.md`;
-  a.click();
-});
+  try {
+    await platform.exportMarkdown(currentDoc.id, currentDoc.title || "document");
+  } catch (e) {
+    toast(`导出失败：${e.message}`, true);
+  }
+}
+
+$("btnImport").addEventListener("click", () => void doImport());
+$("btnExport").addEventListener("click", () => void doExport());
 
 $("btnNew").addEventListener("click", newDoc);
 $("btnSave").addEventListener("click", () => void saveDoc());
@@ -242,7 +268,7 @@ $("btnLoad").addEventListener("click", async () => {
     }
   }
   try {
-    await apiLoad(body);
+    await platform.apiLoad(body);
     toast("已提交加载请求，正在后台加载…");
     void watchLoadResult();
   } catch (e) {
@@ -257,7 +283,7 @@ async function watchLoadResult() {
   while (Date.now() < deadline) {
     let st = null;
     try {
-      st = await apiStatus();
+      st = await platform.apiStatus();
     } catch {
       await new Promise((r) => setTimeout(r, 1000));
       continue;
@@ -279,7 +305,7 @@ function applyStatus(st) {
 
 async function pollStatus() {
   try {
-    applyStatus(await apiStatus());
+    applyStatus(await platform.apiStatus());
   } catch {
     $("statusLine").textContent = "未连接（服务未启动？）";
     $("btnGenerate").disabled = !generating;
@@ -335,7 +361,7 @@ function bindParams() {
 
 async function refreshSkills() {
   try {
-    allSkills = await apiSkills();
+    allSkills = await platform.apiSkills();
   } catch (e) {
     toast(`获取技能库失败：${e.message}`, true);
     return;
@@ -534,7 +560,7 @@ async function startGenerate() {
   setGenStatus(resumeHint);
 
   try {
-    await apiGenerate(
+    await platform.apiGenerate(
       req,
       {
         onCtxPpl: (ppl) => {
@@ -614,7 +640,7 @@ async function startGenerate() {
 async function stopGenerate() {
   setGenStatus("⏹ 正在停止…");
   try {
-    await apiStop();
+    await platform.apiStop();
   } catch { /* 服务不可达也继续中止本地流 */ }
   genCtrl?.abort();
 }
@@ -643,8 +669,28 @@ document.addEventListener("keydown", (e) => {
 
 // ---------------------------------------------------------------- 启动
 
-bindParams();
-newDoc();
-void refreshSkills();
-void pollStatus();
-void refreshDocs();
+// settings/草稿异步装载（浏览器 localStorage 同步可读、webview 经主进程
+// globalState），装载完成后绑定参数、恢复草稿或新建文档，再拉取远端状态。
+async function init() {
+  await loadSettings();
+  bindParams();
+
+  // 脏文档草稿恢复（webview 关闭无确认、浏览器崩溃兜底）；
+  // markClean 时已清除，故存在即代表上次未保存的编辑。
+  const draft = await platform.loadDraft().catch(() => null);
+  if (draft && Array.isArray(draft.blocks) && draft.blocks.length) {
+    currentDoc = { id: draft.id || "", title: draft.title || "未命名文档" };
+    $("docTitle").value = currentDoc.title;
+    editor.setBlocks(draft.blocks.map((b) => ({ ...b })));
+    markClean();
+    toast("已恢复上次未保存的草稿");
+  } else {
+    newDoc();
+  }
+
+  void refreshSkills();
+  void pollStatus();
+  void refreshDocs();
+}
+
+void init();

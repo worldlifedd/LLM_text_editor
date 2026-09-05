@@ -42,16 +42,34 @@ const opts = {
   format: "cjs",
   platform: "node",
   target: "node18",
+  // web/index.html 以文本内联（webEditor.ts 引用，webview 标记单一事实来源）
+  loader: { ".html": "text" },
+  sourcemap: false,
+  minify: false,
+  logLevel: "info",
+};
+
+// Webview 前端：web/webview-main.js（共用 web/ 代码 + 平台抽象层）→
+// dist/webview.js + dist/webview.css（style.css 由 esbuild 自动抽出）。
+// 浏览器版不经此构建（server.py 直接静态托管 web/ 的 ES Modules）。
+const webviewOpts = {
+  entryPoints: [path.resolve(__dirname, "..", "web", "webview-main.js")],
+  bundle: true,
+  outfile: "dist/webview.js",
+  format: "iife",
+  platform: "browser",
+  target: "es2020",
   sourcemap: false,
   minify: false,
   logLevel: "info",
 };
 
 if (watch) {
-  esbuild.context(opts).then((ctx) => {
-    ctx.watch();
+  Promise.all([esbuild.context(opts), esbuild.context(webviewOpts)]).then(([ctx1, ctx2]) => {
+    ctx1.watch();
+    ctx2.watch();
     console.log("[esbuild] watching for changes...");
   });
 } else {
-  esbuild.build(opts).catch(() => process.exit(1));
+  Promise.all([esbuild.build(opts), esbuild.build(webviewOpts)]).catch(() => process.exit(1));
 }

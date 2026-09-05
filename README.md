@@ -8,7 +8,7 @@
 
 - **Gradio 网页前端**（`app.py`，DEPRECATED）：浏览器内编辑，带全量困惑度可视化；已被 Web 块编辑器取代，保留作回退
 
-- **VSCode 插件前端**（`vscode-extension/`，DEPRECATED）：在纯 Markdown 源码里写作（提示词为 `<!-- prompt -->` 注释，生成文本为可见正文）；后续计划以 Custom Editor 复用 `web/` 内核重写
+- **VSCode 插件前端**（`vscode-extension/`）：以 WebviewPanel 编辑器标签页完整承载 Web 块编辑器——与浏览器版共用同一份 `web/` 前端代码，仅传输层与平台能力经 `web/platform.js` 抽象区分（webview 内所有请求由插件主进程 postMessage 代理，不直连网络）；命令面板执行 `GTE: 打开 Web 编辑器` 进入
 
 ## 功能特性
 
@@ -117,7 +117,9 @@ python app.py
 
 ### 方式二：VSCode 插件前端
 
-插件**自带 Python 无头服务端**（打包在扩展目录 `python/` 内），安装后无需手动启动、无需指定 `server.py` 路径——首次打开面板时插件会自动拉起服务。
+插件以 WebviewPanel 编辑器标签页承载 Web 块编辑器，与浏览器版共用同一份前端代码（`web/`）。平台差异经 `web/platform.js` 抽象：webview 内所有 HTTP（含 SSE 生成流）由插件主进程 postMessage 代理，不直连网络；设置与未保存草稿经插件 globalState 持久化。
+
+插件**自带 Python 无头服务端**（打包在扩展目录 `python/` 内），安装后无需手动启动、无需指定 `server.py` 路径——首次使用时插件会自动拉起服务。
 
 1. 安装插件：在 VSCode 中「扩展」→「…」→「从 VSIX 安装」
    （源码调试则在 `vscode-extension/` 内 `npm install` 后按 F5；
@@ -130,13 +132,13 @@ python app.py
    pip install llama-cpp-python   # llama.cpp 模式（GGUF 量化模型）
    ```
 
-3. 在侧边栏 **GTE 生成控制面板** 中连接服务、加载模型 / 连接 API、勾选技能并调整生成参数
+3. 命令面板执行 `GTE: 打开 Web 编辑器`，在编辑器标签页中连接服务、加载模型 / 连接 API、勾选技能并调整生成参数；文档与浏览器版共用 `saves/*.json`，两边可互开同一份文档
 
 > 若使用仓库根目录的 `server.py`（例如调试最新改动），可在设置 `gte.serverScript` 中指定其绝对路径，插件将优先使用。
 
 #### 文档格式
 
-插件以纯 Markdown 为文档载体：提示词块是 `<!-- prompt ... -->` 注释（渲染不可见），生成块是可见正文，每块生成正文前有一行 `<!-- generate -->` 注释作为块边界标记（用于分隔相邻生成块、标记空的活动生成单元）：
+文档以 JSON 块数组保存在服务端 `saves/*.json`（含逐 token 困惑度数据）；Markdown 仅作「导入MD」/「导出MD」的交换格式。交换格式中提示词块是 `<!-- prompt ... -->` 注释（渲染不可见），生成块是可见正文，每块生成正文前有一行 `<!-- generate -->` 注释作为块边界标记（用于分隔相邻生成块、标记空的活动生成单元）：
 
 ```markdown
 <!-- prompt
@@ -152,7 +154,7 @@ python app.py
 
 提示词注释也支持单行写法 `<!-- prompt: 指令内容 -->`。生成仅发生在**最后一块生成块**（活动生成单元）中：文档末尾没有生成块时按 `Ctrl+Enter` 会自动创建。
 
-**系统提示词块**（`<!-- system ... -->` 注释）：技能可经命令 `GTE: 固化技能为系统提示词块`（Gradio 端为「📥 固化选中技能为系统块」按钮）固化为文档顶部的系统块，生成时作为系统级指令拼入上下文。固化后文档自包含——换到没有该技能的环境（另一台机器 / 另一个 skills 目录）也能完整复现生成过程：
+**系统提示词块**（`<!-- system ... -->` 注释）：技能可经技能库列表的「固化」按钮（Gradio 端为「📥 固化选中技能为系统块」按钮）固化为文档顶部的系统块，生成时作为系统级指令拼入上下文。固化后文档自包含——换到没有该技能的环境（另一台机器 / 另一个 skills 目录）也能完整复现生成过程：
 
 ```markdown
 <!-- system
@@ -188,7 +190,7 @@ python app.py
 
 **临近思维链恒回灌**：活动生成单元前紧邻的 cot 块属于"当前进行中的 assistant 回复"，无论正文是否已开始，每次生成都作为思考区回灌进 prompt（历史轮次的思维链仍不进上下文）。这保证续写上下文与首次生成一致——已生成文字的困惑度着色不漂移，KV 前缀缓存可整体复用。
 
-> 注意：Qwen3.5-4B 在未闭合回灌时会持续思考较久（不主动闭合），想尽快出正文可手动补上闭标签或按 `Ctrl+Shift+Enter` 定稿开新块。回灌会把思维链写进 prompt，prefill 开销随其长度线性增长（本地/llama.cpp 后端已利用 KV 前缀复用，仅新增部分 prefill）。
+> 注意：Qwen3.5-4B 在未闭合回灌时会持续思考较久（不主动闭合），想尽快出正文可手动补上闭标签或按 `F2` 定稿开新块。回灌会把思维链写进 prompt，prefill 开销随其长度线性增长（本地/llama.cpp 后端已利用 KV 前缀复用，仅新增部分 prefill）。
 
 Gradio 端在生成块上方提供「🧠 思维链（当前轮）」流式单元格，定稿时随块保存为 cot 块；历史思维链块默认折叠，展开可编辑。
 
@@ -196,20 +198,20 @@ Gradio 端在生成块上方提供「🧠 思维链（当前轮）」流式单�
 
 > llama.cpp 模式能否开关取决于 GGUF 内嵌模板是否识别 `enable_thinking`：Qwen3 系模板在该变量为真时渲染出**未闭合**的 `<think>`，生成流因此不含开标签、只含闭标签，分离器按「思考正文自流首开始」处理；模板不识该变量时开关无效，思考与否由模板默认行为决定。
 
-**思维链困惑度**：本地/llama.cpp 后端思考区 token 的 log-prob 与正文同源，思维链块同样按绿→红色阶着色（VSCode 插件与状态栏指标；定稿后随块冻结）；API 后端不返回 reasoning 的 logprobs，思维链不着色。
+**思维链困惑度**：本地/llama.cpp 后端思考区 token 的 log-prob 与正文同源，思维链块同样按绿→红色阶着色（前端困惑度面板与指标；定稿后随块冻结）；API 后端不返回 reasoning 的 logprobs，思维链不着色。
 
 #### 命令与快捷键
 
-| 命令                     | 快捷键                | 说明                                                |
-| ---------------------- | ------------------ | ------------------------------------------------- |
-| `GTE: 生成 / 停止（同一按键切换）` | `Ctrl+Enter`       | 在活动生成块中流式续写；生成中再按即优雅停止（状态栏持续显示 LLM 工作状态）          |
-| `GTE: 停止生成`            | `Ctrl+Alt+Enter`   | 停止当前生成，保留已生成文本                                    |
-| `GTE: 定稿当前块并开启新块`      | `Ctrl+Shift+Enter` | 锁定前序块、开启新的活动生成块                                   |
-| `GTE: 追加提示词块`          | `Ctrl+Alt+P`       | 在文档末尾追加 `<!-- prompt -->` 注释块                     |
-| `GTE: 固化技能为系统提示词块`     | —                  | 选择技能，固化插入为文档顶部 `<!-- system -->` 注释块（文档自包含、可移植复现） |
-| `GTE: 锁定/解锁光标所在块`      | —                  | 折叠该块，防止误编辑                                        |
-| `GTE: 新建生成式文本文档`       | —                  | 打开带初始模板的新 Markdown 文档                             |
-| `GTE: 打开生成控制面板`        | —                  | 聚焦侧边栏控制面板                                         |
+插件仅保留一个入口命令；编辑操作在 Web 编辑器（webview）内完成，快捷键由编辑器自身捕获，与浏览器版一致：
+
+| 命令 / 快捷键           | 说明                                  |
+| ------------------ | ----------------------------------- |
+| `GTE: 打开 Web 编辑器`  | 打开（或聚焦已打开的）块编辑器标签页；点击状态栏 `GTE:` 项同效 |
+| `Ctrl+Enter`（编辑器内） | 生成 / 停止（同一按键切换）                     |
+| `F2`（编辑器内）         | 定稿当前生成块并开启新块                        |
+| `Ctrl+S`（编辑器内）     | 保存文档                                |
+
+旧命令（`GTE: 生成 / 停止`、`GTE: 定稿当前块`、`GTE: 追加提示词块`、`GTE: 固化技能为系统提示词块`、`GTE: 锁定/解锁光标所在块`、`GTE: 新建生成式文本文档` 等）随「Markdown 源码 + 装饰」旧模式一并移除，功能由 Web 编辑器内对应按钮/快捷键承接；`GTE: 打开生成控制面板` 保留为 `GTE: 打开 Web 编辑器` 的别名。
 
 流式生成的 token 按困惑度着色（绿=确定、红=困惑）；手动编辑后颜色先灰显回退，下次生成时 prefill 打分会为编辑过的文本重新着色（本地 / llama.cpp 模式）。
 
@@ -221,7 +223,8 @@ Gradio 端在生成块上方提供「🧠 思维链（当前轮）」流式单�
 | `gte.autoStartServer` | `true`                  | 服务不可达时自动用 python 拉起 server.py |
 | `gte.pythonCommand`   | `python`                | 启动 server.py 所用 Python 命令     |
 | `gte.serverScript`    | 扩展内 `python/`           | server.py 绝对路径（留空用随包自带服务端）    |
-| `gte.params`          | 见面板                     | 生成参数默认值                       |
+
+生成参数与技能勾选在 Web 编辑器内调整，持久化于插件 globalState（浏览器版则存 localStorage），不再经 `gte.params` 配置。
 
 ## 项目结构
 
@@ -229,8 +232,10 @@ Gradio 端在生成块上方提供「🧠 思维链（当前轮）」流式单�
 ├── web/             # Web 块编辑器前端（纯 vanilla JS，server.py 托管）：
 │   ├── model.js     #   块模型、ppl 对账、LLM 视角消息映射（可移植内核）
 │   ├── editor.js    #   块渲染、contenteditable、块操作、流式更新（可移植内核）
-│   ├── api.js       #   REST + SSE 客户端（VSCode 移植时替换为 postMessage）
+│   ├── platform.js  #   平台抽象：浏览器 / VSCode webview 双实现（可移植内核）
+│   ├── api.js       #   REST + SSE 客户端（浏览器平台实现复用）
 │   ├── app.js       #   编排：文档管理、面板、生成控制器、快捷键
+│   ├── webview-main.js # VSCode webview 打包入口（esbuild → dist/webview.js）
 │   ├── index.html / style.css
 ├── app.py            # Gradio 前端（DEPRECATED，保留作回退）
 ├── server.py         # FastAPI 服务：REST + SSE + 文档 CRUD + Web 前端托管
@@ -240,11 +245,11 @@ Gradio 端在生成块上方提供「🧠 思维链（当前轮）」流式单�
 ├── skills/           # 技能库目录
 │   └── 中文散文写作/SKILL.md
 ├── saves/            # 文档保存目录（运行时生成）
-├── vscode-extension/ # VSCode 插件前端
-│   ├── src/          # 插件源码（TS）：extension/generation/docmodel/panel/… 
+├── vscode-extension/ # VSCode 插件前端（WebviewPanel 承载 web/ 块编辑器）
+│   ├── src/          # 插件源码（TS）：extension（入口）/ webEditor（Webview 代理）/ server / api
 │   ├── python/       # 构建产物：打包时从仓库根自动复制（不入 git）
-│   ├── package.json  # 命令、快捷键、配置项声明
-│   └── esbuild.js    # 构建/打包脚本（编译 + 同步 python/）
+│   ├── package.json  # 命令、配置项声明
+│   └── esbuild.js    # 构建/打包脚本（extension + webview 双入口 + 同步 python/）
 ├── requirements.txt
 ├── kv_cache_test.py      # KV 缓存回归：命中加速/贪心一致性/停止后再生成
 ├── ppl_accum_test.py     # 困惑度累积回归：跨块/编辑容错/序列化兼容
@@ -260,7 +265,7 @@ Gradio 端在生成块上方提供「🧠 思维链（当前轮）」流式单�
 
 三后端（local / llamacpp / api）共享同一套接口（`loaded / load / build_chat_prompt / build_flat_prompt / compute_context_ppl / generate_stream / stop / kind`，签名一致），
 `generate_stream` 产出的 `GenUpdate` 流还须满足统一不变式（前端 `web/editor.js`
-与 VSCode 插件 `generation.ts` 的困惑度着色对账都依赖，详见
+的困惑度着色对账依赖——浏览器与 VSCode webview 共用同一份代码，详见
 `tests/test_backend_contract.py`）：
 
 - `final=True` 的快照有且只有最后一个；
