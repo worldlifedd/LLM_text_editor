@@ -6,7 +6,8 @@ import * as vscode from "vscode";
 import {
   apiLoad, apiMonitor, apiStop, apiUnload, MonitorInfo,
 } from "./api";
-import { ensureServer } from "./server";
+import { ensureServer, log } from "./server";
+import { WebEditorPanel } from "./webEditor";
 
 const FORM_KEY = "gte.monitor.form";
 
@@ -111,6 +112,8 @@ export class MonitorPanel implements vscode.WebviewViewProvider {
     }
     if (m.type === "load") {
       await this.doLoad(m.value as MonitorForm);
+    } else if (m.type === "openEditor") {
+      WebEditorPanel.createOrShow(this.context);
     } else if (m.type === "unload") {
       try {
         await ensureServer();
@@ -149,39 +152,83 @@ export class MonitorPanel implements vscode.WebviewViewProvider {
         n_gpu_layers: form.n_gpu_layers,
         n_ctx: form.n_ctx,
       });
-      vscode.window.showInformationMessage("已提交加载请求，正在后台加载…");
-      void this.watchLoadResult();
     } catch (e) {
       vscode.window.showErrorMessage(`加载失败：${(e as Error).message}`);
+      void this.pushMonitor();
+      return;
     }
+    await this.watchLoadResult();
   }
 
-  /** /api/load 是异步后台任务：loading 由 true→false 时主动弹成功/失败通知。 */
+  /**
+   * /api/load 是异步后台任务：提交后以「通知式进度条」跟踪 loading 状态，
+   * 结束（成功/失败/超时/服务不可达）时进度条自动消失。
+   * - 成功/失败均弹通知，失败详情同时写入「GTE Server」输出面板；
+   * - 进度消息实时推给侧边栏（状态灯 + 加载条）。
+   */
   private async watchLoadResult(): Promise<void> {
     this.loadWatchAbort?.abort(); // 新一次加载提交，中止旧 watcher
     const ac = new AbortController();
     this.loadWatchAbort = ac;
+
+    // 通知式进度条：替代常驻的「已提交加载请求…」toast，结束自动关闭。
+    // resolve 闭包随本 watcher 私有，旧 watcher 结束不会误关新进度条。
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => (resolveDone = resolve));
+    void vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "正在加载模型…",
+        cancellable: false,
+      },
+      (progress) => {
+        progress.report({ message: "已提交加载请求" });
+        return done;
+      }
+    );
+    const finishLoad = (): void => {
+      resolveDone?.();
+      resolveDone = null;
+      // 收起侧边栏加载进度条（成功/失败/超时均不再显示加载态）
+      this.post({ type: "loadState", loading: false, message: "" });
+    };
+
     const deadline = Date.now() + 180000; // 大模型加载最长观察 3 分钟
     let sawLoading = false;
-    while (!ac.signal.aborted && Date.now() < deadline) {
-      let st: MonitorInfo | null = null;
-      try {
-        st = await apiMonitor();
-      } catch {
-        await new Promise((r) => setTimeout(r, 1000));
-        continue;
-      }
-      if (st.loading) sawLoading = true;
-      if (sawLoading && !st.loading) {
-        if (st.loaded) {
-          vscode.window.showInformationMessage(st.message || "✅ 模型加载成功");
-        } else {
-          vscode.window.showErrorMessage(st.message || "❌ 加载失败（未知原因）");
+    let failCount = 0;
+    try {
+      while (!ac.signal.aborted && Date.now() < deadline) {
+        let st: MonitorInfo | null = null;
+        try {
+          st = await apiMonitor();
+          failCount = 0;
+        } catch {
+          // 服务连续不可达（如加载中进程崩溃）：watcher 失去意义，放弃观察
+          if (++failCount >= 5) break;
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
         }
-        void this.pushMonitor();
-        return;
+        // 实时推送加载状态与进度消息到侧边栏
+        this.post({ type: "loadState", loading: st.loading, message: st.message || "" });
+        if (st.loading) sawLoading = true;
+        if (sawLoading && !st.loading) {
+          if (st.loaded) {
+            vscode.window.showInformationMessage(st.message || "✅ 模型加载成功");
+          } else {
+            // 失败详情进输出面板，避免只在通知里一闪而过
+            log(`[load] ${st.message || "加载失败（未知原因）"}`);
+            vscode.window.showErrorMessage(st.message || "❌ 加载失败（未知原因）");
+          }
+          void this.pushMonitor();
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 800));
       }
-      await new Promise((r) => setTimeout(r, 800));
+      // 超时 / 服务不可达：状态由监控轮询自然反映
+      log(`[load] 加载观察超时或服务不可达（${Date.now() >= deadline ? "3 分钟超时" : "服务连接失败"}）`);
+    } finally {
+      // 无论成功/失败/异常：保证进度条与加载态收起
+      finishLoad();
     }
   }
 
@@ -231,6 +278,15 @@ export class MonitorPanel implements vscode.WebviewViewProvider {
     overflow: hidden;
   }
   .bar > div { height: 100%; background: var(--vscode-charts-blue, #3794ff); transition: width .5s; }
+  /* 不确定进度（加载模型）：往复游走 */
+  .bar.indeterminate > div {
+    width: 40%; transition: none;
+    animation: gte-indet 1.2s ease-in-out infinite;
+  }
+  @keyframes gte-indet {
+    0% { margin-left: -40%; }
+    100% { margin-left: 100%; }
+  }
   .muted { opacity: .6; }
   .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
   .ok { background: var(--vscode-testing-iconPassed, #73c991); }
@@ -240,6 +296,8 @@ export class MonitorPanel implements vscode.WebviewViewProvider {
 </style>
 </head>
 <body>
+<button id="btnOpenEditor" style="width:100%; margin-bottom:8px;">打开 Web 编辑器</button>
+
 <h2>后端</h2>
 <div class="row">
   <select id="mode">
@@ -272,6 +330,12 @@ export class MonitorPanel implements vscode.WebviewViewProvider {
 
 <h2>监控</h2>
 <div class="row" id="state"><span class="muted">连接中…</span></div>
+<div id="loadSection" hidden>
+  <div class="row" style="display:flex; align-items:center; gap:6px;">
+    <span class="status-dot spin"></span><span id="loadMsg" class="muted">加载中…</span>
+  </div>
+  <div class="bar indeterminate"><div></div></div>
+</div>
 <div class="row muted" id="msg"></div>
 <div id="modelInfo" hidden>
   <div class="kv"><span>模型</span><span class="v" id="mName"></span></div>
@@ -347,6 +411,9 @@ export class MonitorPanel implements vscode.WebviewViewProvider {
     });
   $("mode").addEventListener("change", applyMode);
 
+  $("btnOpenEditor").addEventListener("click", function () {
+    vscode.postMessage({ type: "openEditor" });
+  });
   $("btnLoad").addEventListener("click", function () {
     vscode.postMessage({ type: "load", value: readForm() });
   });
@@ -423,6 +490,11 @@ export class MonitorPanel implements vscode.WebviewViewProvider {
     if (m.type === "init") writeForm(m.form);
     else if (m.type === "monitor") renderMonitor(m.data);
     else if (m.type === "offline") renderOffline();
+    else if (m.type === "loadState") {
+      // 加载进度：loading 时显示游走进度条 + 服务端实时消息
+      $("loadSection").hidden = !m.loading;
+      if (m.loading) $("loadMsg").textContent = m.message || "加载中…";
+    }
   });
 })();
 </script>

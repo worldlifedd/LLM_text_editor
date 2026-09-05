@@ -20,7 +20,8 @@ export interface ServerStatus {
 let child: ChildProcess | null = null;
 let output: vscode.OutputChannel | null = null;
 
-function log(msg: string): void {
+/** 写入「GTE Server」输出面板（其余模块复用：如加载失败详情）。 */
+export function log(msg: string): void {
   if (!output) output = vscode.window.createOutputChannel("GTE Server");
   output.appendLine(msg);
 }
